@@ -329,30 +329,30 @@ def generate_comparison_sheets(df_source, group_key, final_cols, writer, period_
     
     # 使用数据中的最大日期来定义本期/上期, 以避免日期为空
     max_date = df_source['日期'].max()
+    min_date = df_source['日期'].min() # 引入最小日期辅助判断
     
     # *** 修复 3：修正周期计算逻辑，确保本期和上期有数据 ***
     if period_type == '周':
-        # 找到数据的最大日期，并计算其所在的周日（周结束）
+        # 1. 计算当前周期 (基于 max_date 所在的周)
         max_weekday = max_date.weekday() # 周一=0, 周日=6
-        
-        # 当前周的结束 (以最大日期所在周的周日为准)
         end_of_current = max_date + timedelta(days=6 - max_weekday) 
         start_of_current = end_of_current - timedelta(days=6)
 
-        # 上一个完整周期 (上周)
+        # 2. 计算上一个完整周期 (上期)
         end_of_last = start_of_current - timedelta(days=1)
         start_of_last = end_of_last - timedelta(days=6)
         
         period_col = '周期'
         period_name = '周'
         date_format = '%m/%d'
+        
     else: # 月
-        # 当前月：最大日期所在月份的第一个月
+        # 1. 计算当前周期 (基于 max_date 所在的月份)
         first_of_max_month = max_date.replace(day=1)
         end_of_current = max_date 
         start_of_current = first_of_max_month
         
-        # 上个月
+        # 2. 计算上一个完整周期 (上期)
         end_of_last = first_of_max_month - timedelta(days=1)
         start_of_last = end_of_last.replace(day=1)
         
@@ -363,15 +363,21 @@ def generate_comparison_sheets(df_source, group_key, final_cols, writer, period_
     # --- 阶段一：生成 产品XX总汇表 (累积日期) ---
     sheet_total_name = f'产品{period_name}总汇'
     
-    # 筛选本期和上期数据
+    # 筛选本期数据 (确保本期总是有数据)
     df_current_period = df_source[(df_source['日期'] >= start_of_current) & (df_source['日期'] <= end_of_current)].copy()
-    df_last_period = df_source[(df_source['日期'] >= start_of_last) & (df_source['日期'] <= end_of_last)].copy()
+    
+    # *** 修复 4：如果上期超出了数据的最小范围，则使用空数据帧 ***
+    if start_of_last < min_date:
+        df_last_period = pd.DataFrame()
+        print(f"  [警告] 上期 ({start_of_last} - {end_of_last}) 超出数据范围 ({min_date}), 上期数据将显示为 0.")
+    else:
+        df_last_period = df_source[(df_source['日期'] >= start_of_last) & (df_source['日期'] <= end_of_last)].copy()
 
+
+    # 合并本期和上期（可能为空）
     df_total = pd.concat([df_current_period, df_last_period])
     
     # **优化：直接调用 generate_summary_sheet 来生成带日期细分的总汇表**
-    # 临时使用 '周报总汇' / '月报总汇' 的逻辑来生成，确保日期保留且指标正确
-    # 注意：这里的 df_total 包含本期和上期，分组时应该只按 日期+维度 细分
     generate_summary_sheet(df_total, group_key, final_cols, '周报总汇', sheet_total_name, writer)
 
 
@@ -382,7 +388,12 @@ def generate_comparison_sheets(df_source, group_key, final_cols, writer, period_
     metrics_cols = [col for col in final_cols if col not in ['日期'] + group_key + ['辅助列']] 
     
     # 1. 计算上期总计 (单行总计)
-    df_last_sum = df_last_period[sum_cols].sum().to_frame().T
+    if df_last_period.empty:
+        # 如果上期数据为空，则生成一个空的 DataFrame，确保指标计算结果为 0
+        df_last_sum = pd.DataFrame(columns=df_source.columns)
+    else:
+        df_last_sum = df_last_period[sum_cols].sum().to_frame().T
+    
     df_last_sum = calculate_metrics(df_last_sum)
     df_last_sum = df_last_sum.reindex(columns=df_last_sum.columns.tolist() + [col for col in metrics_cols if col not in df_last_sum.columns], fill_value=0)
     
@@ -417,19 +428,23 @@ def generate_comparison_sheets(df_source, group_key, final_cols, writer, period_
         col_current = f'{col}_current'
         col_last = f'{col}_last'
         
-        if col_current not in df_combined.columns or col_last not in df_combined.columns:
-            df_comp[col] = ''
-            continue
+        # *** 修复 TypeError: 确保操作数是数值 ***
+        if df_combined[col_current].dtype == object or df_combined[col_last].dtype == object:
+             # 对于环比计算, 必须确保数据是 float. 如果是 object (可能是因为前面的 0/NaN 导致), 强制转换
+            df_combined[col_current] = pd.to_numeric(df_combined[col_current], errors='coerce').fillna(0)
+            df_combined[col_last] = pd.to_numeric(df_combined[col_last], errors='coerce').fillna(0)
             
-        # 环比计算逻辑
         if col in ['总消耗(U)', '充值金额(U)', '提现金额(U)', '充减提(U)', '历史消耗(U)', '历史充提差(U)', '新增用户数', '充值人数', '首存人数']:
+            # 环比率计算
             df_comp[col] = np.divide(
                 df_combined[col_current] - df_combined[col_last], 
                 df_combined[col_last]
             ).replace([np.inf, -np.inf], 0).apply(lambda x: f'{x:.1%}')
         elif col in ['注册成本', '首充成本', '盈余率(%)', '首存付费率(%)', '首存盈余率(%)', '新增付费率(%)', '老用户付费率(%)', '老用户盈余率(%)', '付费率(%)', '次日复充率(%)', '3日复充率(%)', '7日复充率(%)', '15日复充率(%)', '30日复充率(%)', '裂变率']:
+            # 成本/比率差值计算 (需要 round(2) 的字段)
             df_comp[col] = (df_combined[col_current] - df_combined[col_last]).replace([np.inf, -np.inf], 0).round(2)
         elif col in ['首存ARPPU', '新增ARPPU', '老用户ARPPU', 'ARPPU', 'LTV-7天', 'LTV-15天', 'LTV-30天', '老用户充减提(U)']:
+            # ARPPU/LTV 差值计算
             df_comp[col] = (df_combined[col_current] - df_combined[col_last]).replace([np.inf, -np.inf], 0).round(2)
         else:
             df_comp[col] = ''
@@ -452,7 +467,7 @@ def generate_comparison_sheets(df_source, group_key, final_cols, writer, period_
 # ==================== 主函数 ====================
 
 def main():
-    print("--- 终极报表生成器 (全自动三维度版) 开始运行 ---")
+    print("--- 极终报表生成器 (全自动三维度版) 开始运行 ---")
     
     # --- 1. 自动读取所有在线和本地数据源 ---
     df_spend = get_spend_data_from_google_sheet(SPEND_SHEET_URL)
