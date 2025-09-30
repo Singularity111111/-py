@@ -1,0 +1,138 @@
+import pandas as pd
+import glob
+import os
+import numpy as np
+
+# ==================== 配置区 ====================
+EXCHANGE_RATE = 280
+SEARCH_PATH = "." 
+# ================================================
+
+def clean_and_prepare_data(df):
+    """数据清洗和预处理函数"""
+    df.columns = [str(col).replace(' (%)', '_pct').replace(' ', '_') for col in df.columns]
+    for col in df.columns:
+        if col in ['日期', '渠道来源']:
+            continue
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+    df.fillna(0, inplace=True)
+    return df
+
+def calculate_ratios_and_convert_currency(summary_df):
+    """根据聚合后的数据，重新计算比率型指标并转换汇率 (适用于任何行)"""
+    df = summary_df.copy()
+    print("  正在重新计算比率并转换汇率...")
+    
+    # 基础数值列
+    sum_cols = ['新增用户数', '日活跃玩家数', '充值人数', '充值金额', '提现金额', '首存人数', '新增付费人数']
+    # 确保列存在，不存在的列以0填充
+    for col in sum_cols:
+        if col not in df.columns:
+            df[col] = 0
+
+    # 重新计算所有比率
+    with np.errstate(divide='ignore', invalid='ignore'):
+        df['充减提'] = df['充值金额'] - df['提现金额']
+        df['盈余率_pct'] = np.divide(df['充减提'], df['充值金额']) * 100
+        df['首存付费率_pct'] = np.divide(df['首存人数'], df['新增用户数']) * 100
+        df['新增付费率_pct'] = np.divide(df['新增付费人数'], df['新增用户数']) * 100
+        df['付费率_pct'] = np.divide(df['充值人数'], df['日活跃玩家数']) * 100
+        df['ARPPU'] = np.divide(df['充值金额'], df['充值人数'])
+        df['ARPU'] = np.divide(df['充值金额'], df['日活跃玩家数'])
+    
+    df.replace([np.inf, -np.inf], 0, inplace=True)
+    df.fillna(0, inplace=True)
+
+    # 转换汇率
+    currency_cols = ['充值金额', '提现金额', '充减提', '首存充值金额', '新增充值金额', '老用户充值金额', '老用户提现金额', 'ARPPU', 'ARPU']
+    for col in currency_cols:
+        if col in df.columns:
+            df[col] = df[col] / EXCHANGE_RATE
+            
+    return df
+
+def process_report_file(file_path, is_aggregated=False):
+    """
+    统一处理所有报表文件。
+    - 如果是日报/周报/月报文件, is_aggregated=False, 会按天聚合。
+    - 如果是总计行, is_aggregated=True, 会直接处理。
+    """
+    print(f"正在处理文件: {os.path.basename(file_path)}")
+    try:
+        df = pd.read_excel(file_path)
+    except Exception as e:
+        print(f"读取文件 '{os.path.basename(file_path)}' 失败: {e}")
+        return None
+
+    df = clean_and_prepare_data(df)
+    
+    # 定义需要直接相加的基础列
+    sum_cols = ['新增注册设备', '新增用户数', '日活跃玩家数', '老玩家日活', '充值人数', '充值金额', '提现金额', '首存人数', '首存充值金额', '新增付费人数', '新增充值金额', '老用户充值人数', '老用户充值金额', '老用户提现金额']
+    sum_cols_exist = [col for col in sum_cols if col in df.columns]
+
+    # 按天聚合所有渠道
+    daily_grouped = df.groupby('日期')[sum_cols_exist].sum().reset_index()
+    
+    # 为每一天重新计算比率和转换汇率
+    final_df = calculate_ratios_and_convert_currency(daily_grouped)
+
+    # 如果是周报或月报，额外计算并添加总计行
+    if is_aggregated:
+        print("  正在计算总计行...")
+        # 计算总计
+        total_summary = pd.DataFrame(daily_grouped[sum_cols_exist].sum()).T
+        # 为总计行重新计算比率和转换汇率
+        total_row = calculate_ratios_and_convert_currency(total_summary)
+        total_row['日期'] = '总计' # 标记为总计行
+        # 将总计行拼接到数据末尾
+        final_df = pd.concat([final_df, total_row], ignore_index=True)
+
+    return final_df
+
+# --- 主程序 ---
+def main():
+    print("--- 报表生成器开始运行 ---")
+    
+    all_files = os.listdir(SEARCH_PATH)
+    daily_files = [f for f in all_files if f.startswith('日报_') and f.endswith('.csv')]
+    weekly_files = [f for f in all_files if f.startswith('Weekly报_') and f.endswith('.csv')]
+    monthly_files = [f for f in all_files if f.startswith('Monthly报_') and f.endswith('.csv')]
+    
+    output_filename = '最终生成报表.xlsx'
+    with pd.ExcelWriter(output_filename, engine='xlsxwriter') as writer:
+        print("\n--- 开始处理日报 ---")
+        if not daily_files:
+            print("警告：未找到日报文件。")
+        else:
+            latest_file = max(daily_files, key=lambda f: os.path.getctime(os.path.join(SEARCH_PATH, f)))
+            df = process_report_file(latest_file, is_aggregated=False)
+            if df is not None:
+                df.to_excel(writer, sheet_name='每日总览', index=False)
+                print("每日总览已写入Excel。")
+
+        print("\n--- 开始处理周报 ---")
+        if not weekly_files:
+            print("警告：未找到周报文件。")
+        else:
+            latest_file = max(weekly_files, key=lambda f: os.path.getctime(os.path.join(SEARCH_PATH, f)))
+            df = process_report_file(latest_file, is_aggregated=True) # 传入is_aggregated=True
+            if df is not None:
+                df.to_excel(writer, sheet_name='每周总览', index=False)
+                print("每周总览已写入Excel。")
+
+        print("\n--- 开始处理月报 ---")
+        if not monthly_files:
+            print("警告：未找到月报文件。")
+        else:
+            latest_file = max(monthly_files, key=lambda f: os.path.getctime(os.path.join(SEARCH_PATH, f)))
+            df = process_report_file(latest_file, is_aggregated=True) # 传入is_aggregated=True
+            if df is not None:
+                df.to_excel(writer, sheet_name='每月总览', index=False)
+                print("每月总览已写入Excel。")
+
+    print("\n" + "="*50)
+    print(f"🎉 全部报表生成成功！请在当前文件夹查看文件: {output_filename}")
+    print("="*50)
+
+if __name__ == '__main__':
+    main()
