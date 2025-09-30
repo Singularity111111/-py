@@ -13,14 +13,13 @@ import xlsxwriter
 warnings.filterwarnings("ignore", category=SettingWithCopyWarning)
 
 # ==================== 终极配置区 ====================
-EXCHANGE_RATE = 281  # *** 修复：汇率配置已更新为 281 ***
+EXCHANGE_RATE = 281  # 汇率配置
 SEARCH_PATH = "."    # 搜索本地源文件的路径
 OUTPUT_FILENAME = '最终生成三维度报表.xlsx'
 # 定义尝试读取本地CSV文件的编码列表：增加更多可能性
 CSV_ENCODINGS = ['utf-8', 'gbk', 'latin1', 'ISO-8859-1', 'cp1252']
 
 # === Google Sheet 消耗数据链接 ===
-# 我们将把你的链接转换成一个可以直接下载CSV的链接
 SPEND_SHEET_URL = "https://docs.google.com/spreadsheets/d/1v_GQLJ28byHFUqfcvdo2OtAbLQaMOCBL9x7Q-MqkjmI/export?format=csv"
 
 # ==================== 最终输出字段定义 ====================
@@ -74,7 +73,14 @@ def write_sheet_with_metadata(df, sheet_name, writer, period_type, exchange_rate
         worksheet = writer.sheets[sheet_name]
 
     # 1. 写入第一行：产品名称和日期
-    current_date_str = date.today().strftime('%Y-%m-%d')
+    # 使用 base_df 的最大日期作为日报日期, 以解决日期缺失问题
+    
+    # *** 修复 3: 使用实际数据中的最大日期作为报表日期 ***
+    try:
+        report_date = df['日期'].max().strftime('%Y-%m-%d')
+    except (KeyError, AttributeError):
+        # 如果 df 中没有 '日期' 列 (例如环比表), 使用今天的日期
+        report_date = date.today().strftime('%Y-%m-%d')
     
     # 日报的起始行从 A1 开始, 对比表从 D1 开始
     start_col_idx = 0 
@@ -90,7 +96,7 @@ def write_sheet_with_metadata(df, sheet_name, writer, period_type, exchange_rate
     
     # 日报写入日期和备注
     if period_type == '日报':
-        worksheet.write('H1', current_date_str)
+        worksheet.write('H1', report_date)
         worksheet.write('L1', '备注：暂无消耗更新')
         
     # 2. 写入第二行 (空行)
@@ -120,7 +126,6 @@ def write_sheet_with_metadata(df, sheet_name, writer, period_type, exchange_rate
     # 4. 写入数据
     # 从第 4 行开始写入数据 (startrow=3)
     df.to_excel(writer, sheet_name=sheet_name, index=False, header=True, startrow=3)
-    # print(f"{sheet_name} 已生成...") # 避免重复输出
 
 def read_source_file(file_pattern):
     """读取指定模式下的最新文件, 并处理 CSV 编码及 CSV/Excel 识别问题"""
@@ -200,15 +205,12 @@ def calculate_metrics(df):
     # 1. 货币单位转换 (PKR -> U)
     currency_cols_pkr = [
         '充值金额', '提现金额', '首存充值金额', '老用户充值金额', 
-        # 假设以下字段也可能在源数据中, 且需要转换
         '投注金额', '佣金', '老用户提现金额', '新增充值金额' 
     ]
     for col in currency_cols_pkr:
         if col in df.columns and f'{col}(U)' not in df.columns:
-            # 仅对未转换的列进行转换
             df[f'{col}(U)'] = df[col].astype(float) / EXCHANGE_RATE
         elif col in df.columns and f'{col}(U)' in df.columns:
-            # 如果原始列和(U)列都在, 确保(U)列是float类型
             df[f'{col}(U)'] = df[f'{col}(U)'].astype(float)
         
     # 重命名 LTV/复充率 相关的列, 以便后续选择
@@ -225,29 +227,19 @@ def calculate_metrics(df):
         
         # 充减提
         df['充减提(U)'] = df.get('充值金额(U)', 0) - df.get('提现金额(U)', 0)
-        
-        # 历史充提差(U) - 需要在分组求和后才能计算准确, 这里先设为占位符
-        # 在 main 函数中, 我们将使用累加和计算这个字段。
         df['历史充提差(U)'] = df.get('历史充提差(U)', 0) 
-        
-        # 老用户充减提(U) - 假设源数据没有老用户提现金额, 使用老用户充值金额作为充减提的代理
-        # 或者假设老用户提现金额可以被估算
         df['老用户充减提(U)'] = df.get('老用户充值金额(U)', 0) - df.get('老用户提现金额(U)', 0)
         
         # 成本 / 盈余率
-        df['总消耗(U)'] = df.get('总消耗(U)', 0) # 确保存在
+        df['总消耗(U)'] = df.get('总消耗(U)', 0) 
         df['注册成本'] = np.divide(df['总消耗(U)'], df.get('新增用户数', 0))
         df['首充成本'] = np.divide(df['总消耗(U)'], df.get('首存人数', 0))
         df['盈余率(%)'] = np.divide(df['充减提(U)'], df.get('充值金额(U)', 0))
         
         # 付费率 / ARPPU / ARPU
-        # 首存付费率(%) - 确保存在
         df['首存付费率(%)'] = df.get('首存付费率(%)', 0)
-        # 新增付费率(%)
         df['新增付费率(%)'] = np.divide(df.get('新增付费人数', 0), df.get('新增用户数', 0))
-        # 老用户付费率(%)
         df['老用户付费率(%)'] = np.divide(df.get('老用户充值人数', 0), df.get('老玩家日活', 0))
-        # 总付费率(%)
         df['付费率(%)'] = np.divide(df.get('充值人数', 0), df.get('日活跃玩家数', 0))
         
         # ARPPU (Average Revenue Per Paying User)
@@ -265,17 +257,22 @@ def generate_summary_sheet(df_source, group_key, final_cols, time_period_str, sh
     
     df_report = df_source.copy()
     
-    # 1. 对分组和日期进行求和 (仅对数值列)
+    # *** 修复 2: 将 总消耗(U) 从总表中带入, 以便进行渠道分解 ***
+    # 找到所有数值列, 排除 group_key, 日期, 和历史累计字段 (历史字段在 main 中处理)
     sum_cols = [col for col in df_report.columns if col not in group_key and col != '日期' and '历史' not in col and not df_report[col].dtype == object]
     
-    # *** 修复 1 & 2：针对日报和总汇表进行不同的处理 ***
+    # 1. 对分组和日期进行求和 
     if time_period_str == '日报':
-        # 日报：只需要日期当天的数据, 不应该有任何分组（特别是产品日报, 只需一行总计）
-        # 仅对数值列进行总和（除了日期和历史字段）
+        # 日报：只需要日期当天的数据
         
         # 如果 group_key 为空 (产品日报), 则直接对所有数据求和, 实现单行总计
         if not group_key:
+            # 单行总计: 使用 sum() 
             df_report = df_report[sum_cols].sum().to_frame().T
+            # *** 修复 1: 重新添加日期字段 ***
+            df_report['日期'] = df_source['日期'].max() if not df_source.empty else None
+            # 重新添加 '产品' 列, 因为它是最终报表需要的
+            df_report['产品'] = df_source['产品'].iloc[0] if '产品' in df_source.columns and not df_source.empty else '总计'
         # 如果 group_key 非空 (部门/渠道日报), 则按部门/渠道分组求和
         else:
             df_report = df_report.groupby(group_key)[sum_cols].sum().reset_index()
@@ -298,8 +295,6 @@ def generate_summary_sheet(df_source, group_key, final_cols, time_period_str, sh
         total_row = df_report_temp.sum(numeric_only=True).to_frame().T
         total_row = total_row.reindex(columns=df_report_temp.columns, fill_value=0)
         
-        # 确保总计行的分组键被设置为 '总计'
-        # 确保 group_key 至少包含一个元素
         if group_key and '日期' not in group_key: 
             total_row[group_key[0]] = '总计' 
         
@@ -321,17 +316,17 @@ def generate_summary_sheet(df_source, group_key, final_cols, time_period_str, sh
 def generate_comparison_sheets(df_source, group_key, final_cols, writer, period_type='周'):
     """生成产品维度特殊的 '总汇' 和 '环比' 对比表"""
     
-    # 1. 准备数据
     df_report = df_source.copy()
+    sum_cols = [col for col in df_report.columns if col not in group_key and col != '日期' and '历史' not in col and not df_report[col].dtype == object]
     
-    # 历史消耗(U)和历史充提差(U)是唯一需要被保留但不需要被加总的字段
-    sum_cols = [col for col in df_report.columns if col not in group_key and col != '日期' and not df_report[col].dtype == object]
-    
-    today = date.today()
+    # *** 修复 3: 使用数据中的最大日期来定义本期/上期, 以避免日期为空 ***
+    max_date = df_source['日期'].max()
     
     if period_type == '周':
-        # 计算本期和上期日期范围
-        end_of_current = today - timedelta(days=today.weekday()) - timedelta(days=1)
+        # 基于数据的最大日期, 计算它所属的周的结束日期
+        # 如果 max_date 是周日 (weekday=6), end_of_current = max_date
+        # 如果 max_date 是周一 (weekday=0), end_of_current = max_date - 1 (如果今天运行, max_date是昨天的)
+        end_of_current = max_date - timedelta(days=max_date.weekday()) + timedelta(days=6)
         start_of_current = end_of_current - timedelta(days=6)
         end_of_last = start_of_current - timedelta(days=1)
         start_of_last = end_of_last - timedelta(days=6)
@@ -340,13 +335,13 @@ def generate_comparison_sheets(df_source, group_key, final_cols, writer, period_
         period_name = '周'
         date_format = '%m/%d'
     else: # 月
-        # 计算本期和上期日期范围 (近30天 vs. 再前30天)
-        end_of_current = today - timedelta(days=1)
+        # 假设月报是最近 30 天 vs 再前 30 天
+        end_of_current = max_date
         start_of_current = end_of_current - timedelta(days=29)
         end_of_last = start_of_current - timedelta(days=1)
         start_of_last = end_of_last - timedelta(days=29)
         
-        period_col = '月份' # 在内部使用月份, 但在最终输出时统一为'周期'
+        period_col = '月份' 
         period_name = '月'
         date_format = '%m/%d'
         
@@ -358,6 +353,7 @@ def generate_comparison_sheets(df_source, group_key, final_cols, writer, period_
     df_last_period = df_source[(df_source['日期'] >= start_of_last) & (df_source['日期'] <= end_of_last)].copy()
 
     df_total = pd.concat([df_current_period, df_last_period])
+    # 周/月总汇按日期和产品分组
     df_total_grouped = df_total.groupby(['日期', group_key])[sum_cols].sum().reset_index()
     df_total_grouped = calculate_metrics(df_total_grouped)
     for col in final_cols:
@@ -373,12 +369,9 @@ def generate_comparison_sheets(df_source, group_key, final_cols, writer, period_
     
     # 定义最终输出的列, 确保包含 '开始' 和 '结束'
     comp_cols_raw = ['开始', '结束', '周期', '始日-末期'] + [col for col in final_cols if col not in ['日期', group_key, '辅助列']]
+    metrics_cols = [col for col in final_cols if col not in ['日期', group_key, '辅助列']] 
     
-    # 找到所有需要参与合并的指标列
-    metrics_cols = [col for col in final_cols if col not in ['日期', group_key, '辅助列']] # 使用最终输出的指标列
-    
-    # 1. 计算上期总计
-    # *** 修复：周/月报总汇对比不需要按 '产品' 分组, 只需要一行总计 ***
+    # 1. 计算上期总计 (单行总计)
     df_last_sum = df_last_period[sum_cols].sum().to_frame().T
     df_last_sum = calculate_metrics(df_last_sum)
     df_last_sum = df_last_sum.reindex(columns=df_last_sum.columns.tolist() + [col for col in metrics_cols if col not in df_last_sum.columns], fill_value=0)
@@ -389,7 +382,7 @@ def generate_comparison_sheets(df_source, group_key, final_cols, writer, period_
     df_last_sum['周期'] = '上' + period_name
     df_last_sum['始日-末期'] = f"{start_of_last.strftime(date_format)}-{end_of_last.strftime(date_format)}"
     
-    # 2. 计算本期总计
+    # 2. 计算本期总计 (单行总计)
     df_current_sum = df_current_period[sum_cols].sum().to_frame().T
     df_current_sum = calculate_metrics(df_current_sum)
     df_current_sum = df_current_sum.reindex(columns=df_current_sum.columns.tolist() + [col for col in metrics_cols if col not in df_current_sum.columns], fill_value=0)
@@ -418,7 +411,7 @@ def generate_comparison_sheets(df_source, group_key, final_cols, writer, period_
             df_comp[col] = ''
             continue
             
-        # 环比计算逻辑保持不变
+        # 环比计算逻辑
         if col in ['总消耗(U)', '充值金额(U)', '提现金额(U)', '充减提(U)', '历史消耗(U)', '历史充提差(U)', '新增用户数', '充值人数', '首存人数']:
             df_comp[col] = np.divide(
                 df_combined[col_current] - df_combined[col_last], 
@@ -484,6 +477,7 @@ def main():
             if '日期' not in df.columns: continue
             df['日期'] = pd.to_datetime(df['日期']).dt.date
             
+            # 使用 base_df 的所有列 + df 的新列进行合并
             cols_to_use = df.columns.difference(base_df.columns).tolist() + on_cols
             base_df = pd.merge(base_df, df[cols_to_use], on='日期', how='left', suffixes=(None, '_y'))
             base_df.drop([col for col in base_df.columns if '_y' in str(col)], axis=1, inplace=True)
@@ -492,25 +486,34 @@ def main():
 
     # --- 3. 生成最终Excel ---
     print("\n--- 开始生成三维度日报、周报、月报 ---")
-    today = date.today()
-    yesterday = today - timedelta(days=1)
+    
+    # *** 修复 3: 使用数据中的最大日期来定义日报日期 ***
+    # 确保 max_date 存在, 否则默认为今天 - 1
+    if not base_df.empty:
+        max_date = base_df['日期'].max()
+    else:
+        max_date = date.today() - timedelta(days=1)
+    
+    yesterday = max_date # 使用数据的最大日期作为日报日期
     
     df_daily = base_df[base_df['日期'] == yesterday].copy()
     
-    end_of_week = today - timedelta(days=today.weekday()) - timedelta(days=1)
+    # 周报日期范围基于 max_date
+    end_of_week = max_date - timedelta(days=max_date.weekday()) + timedelta(days=6)
     start_of_week = end_of_week - timedelta(days=6)
     df_weekly = base_df[(base_df['日期'] >= start_of_week) & (base_df['日期'] <= end_of_week)].copy()
     
-    end_of_month = today - timedelta(days=1)
+    # 月报日期范围基于 max_date
+    end_of_month = max_date
     start_of_month = end_of_month - timedelta(days=29)
     df_monthly = base_df[(base_df['日期'] >= start_of_month) & (base_df['日期'] <= end_of_month)].copy()
     
     REPORT_CONFIGS = [
-        # *** 修复 1: 产品日报 (仅一行总计) group_key: [] ***
+        # 产品日报: 单行总计, group_key: []
         (df_daily, [], PRODUCT_COLS, '日报', '产品-日报'),
         (df_weekly, ['产品'], PRODUCT_COLS, '周报总汇', '产品-周报总汇'),
         (df_monthly, ['产品'], PRODUCT_COLS, '月报总汇', '产品-月报总汇'),
-        # *** 修复 2: 部门/渠道日报/总汇 (正确分组) ***
+        # 部门/渠道日报/总汇: 正确分组
         (df_daily, ['部门'], DEPT_COLS, '日报', '部门-日报'),
         (df_weekly, ['部门'], DEPT_COLS, '周报总汇', '部门-周报总汇'),
         (df_monthly, ['部门'], DEPT_COLS, '月报总汇', '部门-月报总汇'),
