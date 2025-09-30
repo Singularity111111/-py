@@ -2,136 +2,484 @@ import pandas as pd
 import glob
 import os
 import numpy as np
+from datetime import datetime, timedelta, date
+import io
+import warnings
+# 引入 SettingWithCopyWarning，解决 AttributeError
+from pandas.errors import SettingWithCopyWarning
 
-# ==================== 配置区 ====================
-EXCHANGE_RATE = 280
-SEARCH_PATH = "." 
-# ================================================
+# 忽略 Pandas 链式赋值的警告，以保持代码简洁
+warnings.filterwarnings("ignore", category=SettingWithCopyWarning)
 
-def clean_and_prepare_data(df):
-    """数据清洗和预处理函数"""
-    df.columns = [str(col).replace(' (%)', '_pct').replace(' ', '_') for col in df.columns]
-    for col in df.columns:
-        if col in ['日期', '渠道来源']:
-            continue
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    df.fillna(0, inplace=True)
-    return df
+# ==================== 终极配置区 ====================
+EXCHANGE_RATE = 280  # 汇率配置，例如 1 USD = 280 PKR
+SEARCH_PATH = "."    # 搜索本地源文件的路径
+OUTPUT_FILENAME = '最终生成三维度报表.xlsx'
+# 定义尝试读取本地CSV文件的编码列表：增加更多可能性
+CSV_ENCODINGS = ['utf-8', 'gbk', 'latin1', 'ISO-8859-1', 'cp1252']
 
-def calculate_ratios_and_convert_currency(summary_df):
-    """根据聚合后的数据，重新计算比率型指标并转换汇率 (适用于任何行)"""
-    df = summary_df.copy()
-    print("  正在重新计算比率并转换汇率...")
-    
-    # 基础数值列
-    sum_cols = ['新增用户数', '日活跃玩家数', '充值人数', '充值金额', '提现金额', '首存人数', '新增付费人数']
-    # 确保列存在，不存在的列以0填充
-    for col in sum_cols:
-        if col not in df.columns:
-            df[col] = 0
+# === Google Sheet 消耗数据链接 ===
+# 我们将把你的链接转换成一个可以直接下载CSV的链接
+SPEND_SHEET_URL = "https://docs.google.com/spreadsheets/d/1v_GQLJ28byHFUqfcvdo2OtAbLQaMOCBL9x7Q-MqkjmI/export?format=csv"
 
-    # 重新计算所有比率
-    with np.errstate(divide='ignore', invalid='ignore'):
-        df['充减提'] = df['充值金额'] - df['提现金额']
-        df['盈余率_pct'] = np.divide(df['充减提'], df['充值金额']) * 100
-        df['首存付费率_pct'] = np.divide(df['首存人数'], df['新增用户数']) * 100
-        df['新增付费率_pct'] = np.divide(df['新增付费人数'], df['新增用户数']) * 100
-        df['付费率_pct'] = np.divide(df['充值人数'], df['日活跃玩家数']) * 100
-        df['ARPPU'] = np.divide(df['充值金额'], df['充值人数'])
-        df['ARPU'] = np.divide(df['充值金额'], df['日活跃玩家数'])
-    
-    df.replace([np.inf, -np.inf], 0, inplace=True)
-    df.fillna(0, inplace=True)
+# ==================== 最终输出字段定义 ====================
+# A. 产品总汇表字段 (包含 '产品' 维度)
+PRODUCT_COLS = [
+    '日期', '产品', '总消耗(U)', '注册成本', '首充成本', '新增用户数', '充值人数', '充值金额(U)', '提现金额(U)', 
+    '充减提(U)', '盈余率(%)', '首存人数', '首存充值金额(U)', '首存付费率(%)', '首存盈余率(%)', 
+    '首存ARPPU', '新增付费人数', '新增充值金额(U)', '新增付费率(%)', '老用户充值人数', 
+    '老用户充值金额(U)', '老用户付费率(%)', '老用户ARPPU', '老用户盈余率(%)', 'ARPPU', 
+    '次日复充率(%)', '3日复充率(%)', '7日复充率(%)', '15日复充率(%)', '30日复充率(%)', 
+    'LTV-7天', 'LTV-15天', 'LTV-30天', '裂变率', '历史消耗(U)', '历史充提差(U)', '辅助列'
+]
 
-    # 转换汇率
-    currency_cols = ['充值金额', '提现金额', '充减提', '首存充值金额', '新增充值金额', '老用户充值金额', '老用户提现金额', 'ARPPU', 'ARPU']
-    for col in currency_cols:
-        if col in df.columns:
-            df[col] = df[col] / EXCHANGE_RATE
-            
-    return df
+# B. 部门总汇表字段 (包含 '部门' 维度)
+DEPT_COLS = [
+    '日期', '部门', '总消耗(U)', '注册成本', '首充成本', '新增用户数', '充值人数', '充值金额(U)', '提现金额(U)', 
+    '充减提(U)', '盈余率(%)', '首存人数', '首存充值金额(U)', '首存付费率(%)', '首存盈余率(%)', 
+    '首存ARPPU', '新增付费人数', '新增充值金额(U)', '新增付费率(%)', '老用户充值人数', 
+    '老用户充值金额(U)', '老用户付费率(%)', '老用户ARPPU', '老用户盈余率(%)', 'ARPPU', 
+    '次日复充率(%)', '3日复充率(%)', '7日复充率(%)', '15日复充率(%)', '30日复充率(%)', 
+    'LTV-7天', 'LTV-15天', 'LTV-30天', '老用户充减提(U)', '历史消耗(U)', '历史充提差(U)', '老玩家日活'
+]
 
-def process_report_file(file_path, is_aggregated=False):
-    """
-    统一处理所有报表文件。
-    - 如果是日报/周报/月报文件, is_aggregated=False, 会按天聚合。
-    - 如果是总计行, is_aggregated=True, 会直接处理。
-    """
-    print(f"正在处理文件: {os.path.basename(file_path)}")
-    try:
-        df = pd.read_excel(file_path)
-    except Exception as e:
-        print(f"读取文件 '{os.path.basename(file_path)}' 失败: {e}")
+# C. 渠道总汇表字段 (包含 '渠道来源' 和 '部门' 维度)
+CHANNEL_COLS = [
+    '日期', '部门', '渠道来源', '总消耗(U)', '注册成本', '首充成本', '新增用户数', '充值人数', '充值金额(U)', 
+    '提现金额(U)', '充减提(U)', '盈余率(%)', '首存人数', '首存充值金额(U)', '首存付费率(%)', 
+    '首存盈余率(%)', '首存ARPPU', '新增付费人数', '新增充值金额(U)', '新增付费率(%)', '老用户充值人数', 
+    '老用户充值金额(U)', '老用户付费率(%)', '老用户ARPPU', '老用户盈余率(%)', 'ARPPU', 
+    '次日复充率(%)', '3日复充率(%)', '7日复充率(%)', '15日复充率(%)', '30日复充率(%)', 
+    'LTV-7天', 'LTV-15天', 'LTV-30天', '老用户充减提(U)', '历史消耗(U)', '历史充提差(U)', '老玩家日活'
+]
+
+# ==================== 辅助函数 ====================
+
+def read_source_file(file_pattern):
+    """读取指定模式下的最新文件，并处理 CSV 编码及 CSV/Excel 识别问题"""
+    files = glob.glob(os.path.join(SEARCH_PATH, file_pattern))
+    if not files: 
+        print(f"  [警告] 未找到文件: {file_pattern}"); 
         return None
-
-    df = clean_and_prepare_data(df)
+    latest_file = max(files, key=os.path.getctime)
+    print(f"  正在读取: {os.path.basename(latest_file)}")
     
-    # 定义需要直接相加的基础列
-    sum_cols = ['新增注册设备', '新增用户数', '日活跃玩家数', '老玩家日活', '充值人数', '充值金额', '提现金额', '首存人数', '首存充值金额', '新增付费人数', '新增充值金额', '老用户充值人数', '老用户充值金额', '老用户提现金额']
-    sum_cols_exist = [col for col in sum_cols if col in df.columns]
-
-    # 按天聚合所有渠道
-    daily_grouped = df.groupby('日期')[sum_cols_exist].sum().reset_index()
+    # 优先尝试读取为 CSV (处理编码问题)
+    if file_pattern.endswith('.csv'):
+        df = None
+        for encoding in CSV_ENCODINGS:
+            try:
+                # 尝试用当前编码读取
+                df = pd.read_csv(latest_file, encoding=encoding)
+                print(f"  [成功] 使用 '{encoding}' 编码读取 CSV 文件成功.")
+                return df
+            except Exception:
+                continue
+        
+        # 如果所有 CSV 尝试都失败了，可能是 Excel 文件被错误命名为 CSV
+        try:
+            df = pd.read_excel(latest_file)
+            print("  [成功] CSV 编码失败，但以 Excel 格式读取成功.")
+            return df
+        except Exception as e_excel:
+            print(f"  [错误] 文件读取失败: 所有尝试的编码 ({', '.join(CSV_ENCODINGS)}) 都未能成功解析文件，且无法作为 Excel 读取: {e_excel}")
+            return None
     
-    # 为每一天重新计算比率和转换汇率
-    final_df = calculate_ratios_and_convert_currency(daily_grouped)
+    # 对于明确的 Excel 文件 (.xlsx, .xls)
+    else:
+        try:
+            return pd.read_excel(latest_file)
+        except Exception as e: 
+            print(f"  [错误] 读取文件失败: {e}"); 
+            return None
 
-    # 如果是周报或月报，额外计算并添加总计行
-    if is_aggregated:
-        print("  正在计算总计行...")
-        # 计算总计
-        total_summary = pd.DataFrame(daily_grouped[sum_cols_exist].sum()).T
-        # 为总计行重新计算比率和转换汇率
-        total_row = calculate_ratios_and_convert_currency(total_summary)
-        total_row['日期'] = '总计' # 标记为总计行
-        # 将总计行拼接到数据末尾
-        final_df = pd.concat([final_df, total_row], ignore_index=True)
+def get_spend_data_from_google_sheet(url):
+    """从Google Sheet链接自动获取消耗数据，并处理数值转换错误"""
+    print("正在从Google Sheet链接自动读取'消耗'数据...")
+    try:
+        # Pandas可以直接从URL读取CSV数据
+        df_spend_raw = pd.read_csv(url)
+        print("  [成功] 已从链接获取数据。")
+        
+        # 数据处理
+        # 统一日期格式为 datetime.date
+        df_spend_raw['日期'] = pd.to_datetime(df_spend_raw['日期'], format='%Y%m%d').dt.date
+        
+        # 筛选出所有数值列用于求和 (排除'日期'和'和'这两列)
+        spend_cols = [col for col in df_spend_raw.columns if col not in ['日期', '和', '备注']]
+        
+        # === 修复：强制转换数值类型，解决 can only concatenate str 错误 ===
+        # errors='coerce' 会将无法转换的值（例如表格中的空值、文本）设为 NaN
+        for col in spend_cols:
+            df_spend_raw[col] = pd.to_numeric(df_spend_raw[col], errors='coerce')
+        
+        # 计算总消耗 (NaN 会被自动忽略)
+        df_spend_raw['总消耗(U)'] = df_spend_raw[spend_cols].sum(axis=1)
+        
+        # 历史累计数据：使用累加和计算历史消耗
+        df_spend_raw['历史消耗(U)'] = df_spend_raw['总消耗(U)'].cumsum()
+        
+        # 返回核心消耗数据
+        return df_spend_raw[['日期', '总消耗(U)', '历史消耗(U)']]
+    except Exception as e:
+        print(f"  [错误] 自动读取Google Sheet失败: {e}")
+        print("  请检查链接是否有效，或者网络连接是否正常。")
+        return pd.DataFrame(columns=['日期', '总消耗(U)', '历史消耗(U)'])
 
-    return final_df
+def calculate_metrics(df):
+    """计算所有衍生指标，并进行币种转换"""
+    df = df.copy()
+    
+    # 1. 货币单位转换 (PKR -> U)
+    currency_cols_pkr = [
+        '充值金额', '提现金额', '首存充值金额', '老用户充值金额', 
+        # 假设以下字段也可能在源数据中，且需要转换
+        '投注金额', '佣金', '老用户提现金额', '新增充值金额' 
+    ]
+    for col in currency_cols_pkr:
+        if col in df.columns and f'{col}(U)' not in df.columns:
+            # 仅对未转换的列进行转换
+            df[f'{col}(U)'] = df[col].astype(float) / EXCHANGE_RATE
+        elif col in df.columns and f'{col}(U)' in df.columns:
+            # 如果原始列和(U)列都在，确保(U)列是float类型
+            df[f'{col}(U)'] = df[f'{col}(U)'].astype(float)
+        
+    # 重命名 LTV/复充率 相关的列，以便后续选择
+    df.rename(columns={
+        '次日留存(%)': '次日复充率(%)', 
+        '3日留存(%)': '3日复充率(%)', 
+        '7日留存(%)': '7日复充率(%)',
+        '15日留存(%)': '15日复充率(%)',
+        '30日留存(%)': '30日复充率(%)'
+    }, inplace=True)
 
-# --- 主程序 ---
+    # 2. 核心计算 (避免除零/无限大错误)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        
+        # 充减提
+        df['充减提(U)'] = df.get('充值金额(U)', 0) - df.get('提现金额(U)', 0)
+        
+        # 历史充提差(U) - 需要在分组求和后才能计算准确，这里先设为占位符
+        # 在 main 函数中，我们将使用累加和计算这个字段。
+        df['历史充提差(U)'] = df.get('历史充提差(U)', 0) 
+        
+        # 老用户充减提(U) - 假设源数据没有老用户提现金额，使用老用户充值金额作为充减提的代理
+        # 或者假设老用户提现金额可以被估算
+        df['老用户充减提(U)'] = df.get('老用户充值金额(U)', 0) - df.get('老用户提现金额(U)', 0)
+        
+        # 成本 / 盈余率
+        df['总消耗(U)'] = df.get('总消耗(U)', 0) # 确保存在
+        df['注册成本'] = np.divide(df['总消耗(U)'], df.get('新增用户数', 0))
+        df['首充成本'] = np.divide(df['总消耗(U)'], df.get('首存人数', 0))
+        df['盈余率(%)'] = np.divide(df['充减提(U)'], df.get('充值金额(U)', 0))
+        
+        # 付费率 / ARPPU / ARPU
+        # 首存付费率(%) - 确保存在
+        df['首存付费率(%)'] = df.get('首存付费率(%)', 0)
+        # 新增付费率(%)
+        df['新增付费率(%)'] = np.divide(df.get('新增付费人数', 0), df.get('新增用户数', 0))
+        # 老用户付费率(%)
+        df['老用户付费率(%)'] = np.divide(df.get('老用户充值人数', 0), df.get('老玩家日活', 0))
+        # 总付费率(%)
+        df['付费率(%)'] = np.divide(df.get('充值人数', 0), df.get('日活跃玩家数', 0))
+        
+        # ARPPU (Average Revenue Per Paying User)
+        df['首存ARPPU'] = np.divide(df.get('首存充值金额(U)', 0), df.get('首存人数', 0))
+        df['新增ARPPU'] = np.divide(df.get('新增充值金额(U)', 0), df.get('新增付费人数', 0))
+        df['老用户ARPPU'] = np.divide(df.get('老用户充值金额(U)', 0), df.get('老用户充值人数', 0))
+        df['ARPPU'] = np.divide(df.get('充值金额(U)', 0), df.get('充值人数', 0)) # Total ARPPU
+        
+    # 3. 最终清理
+    df.replace([np.inf, -np.inf], 0, inplace=True); df.fillna(0, inplace=True)
+    return df
+
+def generate_summary_sheet(df_source, group_key, final_cols, time_period_str, sheet_name, writer):
+    """生成每日、每周总汇或每月总汇的标准报表"""
+    
+    df_report = df_source.copy()
+    
+    # 1. 对分组和日期进行求和 (仅对数值列)
+    # 排除分组字段和历史累计字段（历史字段不应该在求和中被计算）
+    sum_cols = [col for col in df_report.columns if col not in group_key and col != '日期' and '历史' not in col and not df_report[col].dtype == object]
+    
+    # 周报/月报需要对数据进行求和
+    if time_period_str != '日报':
+        df_report = df_report.groupby(group_key)[sum_cols].sum().reset_index()
+    
+    # 2. 重新计算衍生指标
+    df_report = calculate_metrics(df_report)
+    
+    # 3. 确保最终字段都存在，并选择字段
+    for col in final_cols:
+        if col not in df_report.columns:
+            df_report[col] = 0
+
+    # 4. 输出到 Excel
+    df_report = df_report[final_cols]
+    
+    # 如果是周报或月报总汇，添加总计行
+    if time_period_str != '日报':
+        total_row = df_report.sum(numeric_only=True).to_frame().T
+        # 确保总计行与主DF具有相同的列结构，以便后续合并
+        total_row = total_row.reindex(columns=df_report.columns, fill_value=0)
+        total_row[group_key[0]] = '总计' # 假设第一个分组键足以标识总计
+        
+        df_report = pd.concat([df_report, total_row], ignore_index=True)
+        
+        # === 修复：使用 loc 和 isin 来安全地重新计算总计行的百分比/成本指标 ===
+        # 找到总计行的索引位置
+        total_idx = df_report[df_report[group_key[0]] == '总计'].index
+        
+        # 隔离总计行进行计算
+        df_total_calc = df_report.loc[total_idx].copy()
+        df_total_calc = calculate_metrics(df_total_calc)
+        
+        # 提取需要更新的指标列
+        metrics_to_update = ['注册成本', '首充成本', '盈余率(%)', '新增付费率(%)', '老用户付费率(%)', '付费率(%)', '首存ARPPU', '新增ARPPU', '老用户ARPPU', 'ARPPU']
+        
+        # 安全地将计算结果写回到原始DataFrame的总计行
+        df_report.loc[total_idx, metrics_to_update] = df_total_calc[metrics_to_update].values
+    
+    df_report.to_excel(writer, sheet_name=sheet_name, index=False)
+    print(f"{sheet_name} 已生成...")
+
+def generate_comparison_sheets(df_source, group_key, final_cols, writer, period_type='周'):
+    """生成产品维度特殊的 '总汇' 和 '环比' 对比表"""
+    
+    # 1. 准备数据
+    df_report = df_source.copy()
+    
+    # === 关键修改：将历史累计字段包含在 sum_cols 中，以便它们在分组求和后不会丢失 ===
+    # 注意：这里的求和只是为了确保这些列在 df_last_sum/df_current_sum 中存在。
+    # 对于历史数据，我们更关心期末值，而不是期内加总。
+    # 历史消耗(U)和历史充提差(U)是唯一需要被保留但不需要被加总的字段
+    sum_cols = [col for col in df_report.columns if col not in group_key and col != '日期' and not df_report[col].dtype == object]
+    
+    today = date.today()
+    
+    if period_type == '周':
+        # 计算本期和上期日期范围
+        end_of_current = today - timedelta(days=today.weekday()) - timedelta(days=1)
+        start_of_current = end_of_current - timedelta(days=6)
+        end_of_last = start_of_current - timedelta(days=1)
+        start_of_last = end_of_last - timedelta(days=6)
+        
+        period_col = '周期'
+        period_name = '周'
+        date_format = '%m/%d'
+    else: # 月
+        # 计算本期和上期日期范围 (近30天 vs. 再前30天)
+        end_of_current = today - timedelta(days=1)
+        start_of_current = end_of_current - timedelta(days=29)
+        end_of_last = start_of_current - timedelta(days=1)
+        start_of_last = end_of_last - timedelta(days=29)
+        
+        period_col = '月份'
+        period_name = '月'
+        date_format = '%m/%d'
+        
+    # --- 阶段一：生成 产品XX总汇表 (累积日期) ---
+    sheet_total_name = f'产品{period_name}总汇'
+    
+    # 筛选本期和上期数据
+    df_current_period = df_source[(df_source['日期'] >= start_of_current) & (df_source['日期'] <= end_of_current)].copy()
+    df_last_period = df_source[(df_source['日期'] >= start_of_last) & (df_source['日期'] <= end_of_last)].copy()
+
+    # 合并两期数据并求和 (周报总汇就是求和)
+    df_total = pd.concat([df_current_period, df_last_period])
+    # 确保日期列用于最终展示，所以要先分组求和
+    df_total_grouped = df_total.groupby(['日期', group_key])[sum_cols].sum().reset_index()
+    
+    # 重新计算衍生指标
+    df_total_grouped = calculate_metrics(df_total_grouped)
+    
+    # 确保最终字段都存在，并选择字段
+    for col in final_cols:
+        if col not in df_total_grouped.columns:
+            df_total_grouped[col] = 0
+            
+    # 输出总汇表
+    df_total_grouped[final_cols].to_excel(writer, sheet_name=sheet_total_name, index=False)
+    print(f"{sheet_total_name} (累积日期) 已生成...")
+
+    # --- 阶段二：生成 产品XX报表 (对比环比) ---
+    sheet_comp_name = f'产品{period_name}报表'
+    
+    # === 关键修复：动态设置 comp_cols 的第一个周期列 ===
+    comp_cols = [period_col, '始日-末期'] + [col for col in final_cols if col not in ['日期', group_key, '辅助列']]
+    
+    # 找到所有需要参与合并的指标列
+    metrics_cols = [col for col in comp_cols if col not in [period_col, '始日-末期']]
+    
+    # 1. 计算上期总计
+    df_last_sum = df_last_period.groupby(group_key)[sum_cols].sum().reset_index()
+    df_last_sum = calculate_metrics(df_last_sum)
+    
+    # === 关键修复点 1: 强制 reindex 确保所有指标列都存在于 df_last_sum 中 ===
+    df_last_sum = df_last_sum.reindex(columns=df_last_sum.columns.tolist() + [col for col in metrics_cols if col not in df_last_sum.columns], fill_value=0)
+    
+    df_last_sum[period_col] = '上' + period_name
+    df_last_sum['始日-末期'] = f"{start_of_last.strftime(date_format)}-{end_of_last.strftime(date_format)}"
+    
+    # 2. 计算本期总计
+    df_current_sum = df_current_period.groupby(group_key)[sum_cols].sum().reset_index()
+    df_current_sum = calculate_metrics(df_current_sum)
+    
+    # === 关键修复点 2: 强制 reindex 确保所有指标列都存在于 df_current_sum 中 ===
+    df_current_sum = df_current_sum.reindex(columns=df_current_sum.columns.tolist() + [col for col in metrics_cols if col not in df_current_sum.columns], fill_value=0)
+    
+    df_current_sum[period_col] = '本' + period_name
+    df_current_sum['始日-末期'] = f"{start_of_current.strftime(date_format)}-{end_of_current.strftime(date_format)}"
+    
+    # 3. 创建环比行
+    df_combined = pd.merge(
+        df_current_sum.drop([period_col, '始日-末期'], axis=1), 
+        df_last_sum.drop([period_col, '始日-末期'], axis=1), 
+        on=group_key, 
+        suffixes=('_current', '_last')
+    )
+
+    df_comp = pd.DataFrame()
+    for col in comp_cols:
+        if col in [period_col, '始日-末期']: # 使用动态的 period_col
+            continue
+
+        col_current = f'{col}_current'
+        col_last = f'{col}_last'
+        
+        # 如果列依然缺失，赋值空字符串
+        if col_current not in df_combined.columns or col_last not in df_combined.columns:
+            df_comp[col] = ''
+            continue
+            
+        if col in ['总消耗(U)', '充值金额(U)', '提现金额(U)', '充减提(U)', '历史消耗(U)', '历史充提差(U)', '新增用户数', '充值人数', '首存人数']:
+            # 绝对值指标：计算百分比环比 (本期-上期)/上期
+            df_comp[col] = np.divide(
+                df_combined[col_current] - df_combined[col_last], 
+                df_combined[col_last]
+            ).replace([np.inf, -np.inf], 0).apply(lambda x: f'{x:.1%}')
+        elif col in ['注册成本', '首充成本', '盈余率(%)', '首存付费率(%)', '首存盈余率(%)', '新增付费率(%)', '老用户付费率(%)', '老用户盈余率(%)', '付费率(%)', '次日复充率(%)', '3日复充率(%)', '7日复充率(%)', '15日复充率(%)', '30日复充率(%)', '裂变率']:
+            # 百分比/成本指标：计算数差环比 (本期 - 上期)
+            df_comp[col] = (df_combined[col_current] - df_combined[col_last]).replace([np.inf, -np.inf], 0).round(2)
+        elif col in ['首存ARPPU', '新增ARPPU', '老用户ARPPU', 'ARPPU', 'LTV-7天', 'LTV-15天', 'LTV-30天', '老用户充减提(U)']:
+             # 货币/数值指标：计算数差环比 (本期 - 上期)
+            df_comp[col] = (df_combined[col_current] - df_combined[col_last]).replace([np.inf, -np.inf], 0).round(2)
+        else:
+            df_comp[col] = ''
+    
+    df_comp[period_col] = '环比'
+    df_comp['始日-末期'] = f'本{period_name}-上{period_name}'
+
+    # 4. 合并最终对比报表 (上期、本期、环比)
+    final_comp = pd.concat([df_last_sum[comp_cols], df_current_sum[comp_cols], df_comp[comp_cols]], ignore_index=True)
+    
+    final_comp.to_excel(writer, sheet_name=sheet_comp_name, index=False)
+    print(f"{sheet_comp_name} (对比环比) 已生成...")
+
+# ==================== 主函数 ====================
+
 def main():
-    print("--- 报表生成器开始运行 ---")
+    print("--- 终极报表生成器 (全自动三维度版) 开始运行 ---")
     
-    all_files = os.listdir(SEARCH_PATH)
-    daily_files = [f for f in all_files if f.startswith('日报_') and f.endswith('.csv')]
-    weekly_files = [f for f in all_files if f.startswith('Weekly报_') and f.endswith('.csv')]
-    monthly_files = [f for f in all_files if f.startswith('Monthly报_') and f.endswith('.csv')]
+    # --- 1. 自动读取所有在线和本地数据源 ---
+    df_spend = get_spend_data_from_google_sheet(SPEND_SHEET_URL)
+    # 假设渠道报表包含 '日期', '产品', '部门', '渠道来源' 以及所有数值指标
+    df_channel = read_source_file('download_渠道报表_*.csv') 
+    df_ops = read_source_file('download_运营报表_*.csv') 
+    df_ltv = read_source_file('download_新增用户LTV_*.csv')
+    df_retention = read_source_file('download_用户留存_*.csv')
     
-    output_filename = '最终生成报表.xlsx'
-    with pd.ExcelWriter(output_filename, engine='xlsxwriter') as writer:
-        print("\n--- 开始处理日报 ---")
-        if not daily_files:
-            print("警告：未找到日报文件。")
-        else:
-            latest_file = max(daily_files, key=lambda f: os.path.getctime(os.path.join(SEARCH_PATH, f)))
-            df = process_report_file(latest_file, is_aggregated=False)
-            if df is not None:
-                df.to_excel(writer, sheet_name='每日总览', index=False)
-                print("每日总览已写入Excel。")
+    # --- 2. 数据预处理和合并 ---
+    print("\n--- 开始数据预处理和合并 ---")
+    # 渠道报表是基础数据源，如果读取失败，直接退出
+    if df_channel is None or df_channel.empty: 
+        print("[致命错误] 渠道报表是基础数据源，请确保文件存在且能被正确读取。"); return
 
-        print("\n--- 开始处理周报 ---")
-        if not weekly_files:
-            print("警告：未找到周报文件。")
-        else:
-            latest_file = max(weekly_files, key=lambda f: os.path.getctime(os.path.join(SEARCH_PATH, f)))
-            df = process_report_file(latest_file, is_aggregated=True) # 传入is_aggregated=True
-            if df is not None:
-                df.to_excel(writer, sheet_name='每周总览', index=False)
-                print("每周总览已写入Excel。")
+    # 基础数据处理，确保日期和分组键是正确的类型
+    df_channel['日期'] = pd.to_datetime(df_channel['日期']).dt.date
+    # 确保分组字段存在，否则报表无法生成
+    if '产品' not in df_channel.columns: df_channel['产品'] = '未分类产品'
+    if '部门' not in df_channel.columns: df_channel['部门'] = '未分类部门'
+    if '渠道来源' not in df_channel.columns: df_channel['渠道来源'] = '未分类渠道'
+    
+    # 以渠道报表为基础，保留所有维度字段
+    base_df = df_channel.copy()
+    
+    # 合并辅助报表
+    dfs_to_merge = [
+        (df_ops, '运营报表', ['日期']), 
+        (df_ltv, 'LTV报表', ['日期']), 
+        (df_retention, '留存报表', ['日期']), 
+        (df_spend, '消耗报表', ['日期']) # 消耗表只合并日期维度
+    ]
+    
+    for df, name, on_cols in dfs_to_merge:
+        if df is not None and not df.empty:
+            if '时间' in df.columns and '日期' not in df.columns: df.rename(columns={'时间': '日期'}, inplace=True)
+            if '日期' not in df.columns: continue
+            df['日期'] = pd.to_datetime(df['日期']).dt.date
+            
+            # 合并数据
+            # 仅合并辅助表中有，但基础表中没有的列
+            cols_to_use = df.columns.difference(base_df.columns).tolist() + on_cols
+            base_df = pd.merge(base_df, df[cols_to_use], on='日期', how='left', suffixes=(None, '_y'))
+            # 清理合并过程中产生的冗余列
+            base_df.drop([col for col in base_df.columns if '_y' in str(col)], axis=1, inplace=True)
 
-        print("\n--- 开始处理月报 ---")
-        if not monthly_files:
-            print("警告：未找到月报文件。")
-        else:
-            latest_file = max(monthly_files, key=lambda f: os.path.getctime(os.path.join(SEARCH_PATH, f)))
-            df = process_report_file(latest_file, is_aggregated=True) # 传入is_aggregated=True
-            if df is not None:
-                df.to_excel(writer, sheet_name='每月总览', index=False)
-                print("每月总览已写入Excel。")
+    base_df.fillna(0, inplace=True)
 
+    # --- 3. 生成最终Excel ---
+    print("\n--- 开始生成三维度日报、周报、月报 ---")
+    today = date.today()
+    yesterday = today - timedelta(days=1)
+    
+    # 定义时间范围
+    
+    # 日报
+    df_daily = base_df[base_df['日期'] == yesterday].copy()
+    
+    # 周报 (最近7天)
+    end_of_week = today - timedelta(days=today.weekday()) - timedelta(days=1)
+    start_of_week = end_of_week - timedelta(days=6)
+    df_weekly = base_df[(base_df['日期'] >= start_of_week) & (base_df['日期'] <= end_of_week)].copy()
+    
+    # 月报 (最近30天)
+    end_of_month = today - timedelta(days=1)
+    start_of_month = end_of_month - timedelta(days=29)
+    df_monthly = base_df[(base_df['日期'] >= start_of_month) & (base_df['日期'] <= end_of_month)].copy()
+    
+    # 核心报表配置列表
+    REPORT_CONFIGS = [
+        # (数据源, 分组键, 最终列, 时间周期, Sheet名称)
+        # 产品总汇表
+        (df_daily, ['产品'], PRODUCT_COLS, '日报', '产品-日报'),
+        (df_weekly, ['产品'], PRODUCT_COLS, '周报总汇', '产品-周报总汇'),
+        (df_monthly, ['产品'], PRODUCT_COLS, '月报总汇', '产品-月报总汇'),
+        # 部门总汇表
+        (df_daily, ['部门'], DEPT_COLS, '日报', '部门-日报'),
+        (df_weekly, ['部门'], DEPT_COLS, '周报总汇', '部门-周报总汇'),
+        (df_monthly, ['部门'], DEPT_COLS, '月报总汇', '部门-月报总汇'),
+        # 渠道总汇表
+        (df_daily, ['部门', '渠道来源'], CHANNEL_COLS, '日报', '渠道-日报'),
+        (df_weekly, ['部门', '渠道来源'], CHANNEL_COLS, '周报总汇', '渠道-周报总汇'),
+        (df_monthly, ['部门', '渠道来源'], CHANNEL_COLS, '月报总汇', '渠道-月报总汇'),
+    ]
+
+    with pd.ExcelWriter(OUTPUT_FILENAME, engine='xlsxwriter') as writer:
+        
+        # A. 生成 9 个标准总汇报表
+        for df, group_key, final_cols, time_period, sheet_name in REPORT_CONFIGS:
+            if not df.empty:
+                generate_summary_sheet(df, group_key, final_cols, time_period, sheet_name, writer)
+
+        # B. 生成 产品周报/月报 对比表 (特殊要求)
+        if not df_weekly.empty:
+            generate_comparison_sheets(df_weekly, '产品', PRODUCT_COLS, writer, period_type='周')
+        if not df_monthly.empty:
+            generate_comparison_sheets(df_monthly, '产品', PRODUCT_COLS, writer, period_type='月')
+            
     print("\n" + "="*50)
-    print(f"🎉 全部报表生成成功！请在当前文件夹查看文件: {output_filename}")
+    print(f"🎉 终极三维度报表生成成功！请在当前文件夹查看文件: {OUTPUT_FILENAME}")
     print("="*50)
 
 if __name__ == '__main__':
