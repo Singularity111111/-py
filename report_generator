@@ -16,7 +16,7 @@ SEARCH_PATH = "."
 OUTPUT_FILENAME = '最终生成三维度报表.xlsx'
 CSV_ENCODINGS = ['utf-8-sig', 'utf-8', 'gbk', 'latin1', 'ISO-8859-1', 'cp1252']
 SPEND_SHEET_URL = "https://docs.google.com/spreadsheets/d/1v_GQLJ28byHFUqfcvdo2OtAbLQaMOCBL9x7Q-MqkjmI/export?format=csv"
-OVERRIDE_DATE = "2025-10-2"
+OVERRIDE_DATE = None 
 
 # ==================== 输出字段定义 ====================
 # 原有字段
@@ -67,6 +67,18 @@ def map_and_aggregate(df, df_mapping, value_cols, weight_col):
             if keyword in str(channel): return dept
         return 'unknown'
     df['部门'] = df.iloc[:, 1].apply(map_channel_to_dept)
+
+    # [新增] 增加明确的配置警告
+    unmapped_channels = df[df['部门'] == 'unknown'].iloc[:, 1].unique()
+    if len(unmapped_channels) > 0:
+        print("\n" + "="*20 + " [配置警告] " + "="*20)
+        print(f"  以下渠道/来源在'总代名称部门规律表.csv'中找不到匹配的部门，将被归入'unknown'：")
+        for channel in unmapped_channels:
+            print(f"   - {channel}")
+        print("  这可能导致【部门-日报】和【渠道-日报】中的复充率等数据为0。")
+        print("  请检查您的映射表，为这些渠道/来源添加正确的部门映射。")
+        print("="*65 + "\n")
+
     for col in value_cols:
         if col in df.columns:
             df[f'weighted_{col}'] = pd.to_numeric(df[col], errors='coerce').fillna(0) * pd.to_numeric(df[weight_col], errors='coerce').fillna(0)
@@ -75,29 +87,52 @@ def map_and_aggregate(df, df_mapping, value_cols, weight_col):
     dept_summary = df.groupby('部门').agg(agg_dict).reset_index()
     for col in value_cols:
         if f'weighted_{col}' in dept_summary.columns and dept_summary[weight_col].sum() > 0:
-            dept_summary[col] = dept_summary[f'weighted_{col}'] / dept_summary[weight_col].replace(0, np.nan)
+            avg_rate = dept_summary[f'weighted_{col}'] / dept_summary[weight_col].replace(0, np.nan)
+            dept_summary[col] = avg_rate / 100.0
     return dept_summary[['部门'] + value_cols].fillna(0)
 
 def read_and_process_recharge_data(df_recharge_source, df_mapping, report_date):
-    print("--- 正在处理【首充用户分析】数据以获取复充率 ---")
-    if df_recharge_source is None or df_recharge_source.empty: return pd.DataFrame()
+    print("--- 正在为日报处理【首充用户分析】数据 ---")
+    if df_recharge_source is None or df_recharge_source.empty: return pd.DataFrame(), pd.Series(dtype=float)
+    
     df_recharge = df_recharge_source.copy()
-    df_recharge.rename(columns={'首充人数': '首存人数'}, inplace=True)
+    if '首充人数' in df_recharge.columns:
+        df_recharge.rename(columns={'首充人数': '首存人数'}, inplace=True)
+
     rate_map = {'次日复充率(%)': 1, '3日复充率(%)': 3, '7日复充率(%)': 7, '15日复充率(%)': 15, '30日复充率(%)': 30}
-    all_rates = []
+    all_dept_rates = []
+    total_rates = {}
+
     for rate_col, days_back in rate_map.items():
         if rate_col not in df_recharge.columns: continue
+        
         target_date = report_date - timedelta(days=days_back)
         cohort_data = df_recharge[df_recharge['日期'] == target_date].copy()
+        
         if not cohort_data.empty:
+            cohort_data[rate_col] = pd.to_numeric(cohort_data[rate_col], errors='coerce').fillna(0)
+            cohort_data['首存人数'] = pd.to_numeric(cohort_data['首存人数'], errors='coerce').fillna(0)
+            
+            weighted_sum = (cohort_data[rate_col] * cohort_data['首存人数']).sum()
+            total_users = cohort_data['首存人数'].sum()
+            avg_rate = weighted_sum / total_users if total_users > 0 else 0
+            total_rates[rate_col] = avg_rate / 100.0
+            
             dept_rates = map_and_aggregate(cohort_data, df_mapping, [rate_col], '首存人数')
-            all_rates.append(dept_rates)
-    if not all_rates: return pd.DataFrame()
-    final_df = all_rates[0]
-    for df in all_rates[1:]:
-        if not df.empty: final_df = pd.merge(final_df, df, on='部门', how='outer')
-    print("--- 复充率数据处理完成 ---\n")
-    return final_df.fillna(0)
+            all_dept_rates.append(dept_rates)
+        else:
+            total_rates[rate_col] = 0
+
+    if not all_dept_rates: 
+        return pd.DataFrame(), pd.Series(total_rates)
+
+    final_dept_df = all_dept_rates[0]
+    for df in all_dept_rates[1:]:
+        if not df.empty: final_dept_df = pd.merge(final_dept_df, df, on='部门', how='outer')
+    
+    print("--- 日报复充率数据处理完成 ---\n")
+    return final_dept_df.fillna(0), pd.Series(total_rates)
+
 
 # ==================== 辅助函数 ====================
 def write_sheet_with_metadata(df, sheet_name, writer, period_type, exchange_rate):
@@ -106,14 +141,13 @@ def write_sheet_with_metadata(df, sheet_name, writer, period_type, exchange_rate
     if '日期' in df.columns and not df['日期'].dropna().empty:
         valid_dates = pd.to_datetime(df['日期'].dropna(), errors='coerce').dropna()
         if not valid_dates.empty: report_date = valid_dates.max().strftime('%Y-%m-%d')
-
-    # 根据报表类型添加不同的标题
+    
     header_format = workbook.add_format({'align': 'left', 'bold': True, 'font_size': 11})
     if period_type in ['日报', '周报总汇', '月报总汇']:
         worksheet.merge_range('B1:F1', '产品：aa-巴基斯坦（EpiWin）', header_format)
         if period_type == '日报':
              worksheet.write('H1', f"日报日期: {report_date}", header_format)
-    else: # 针对新的周报和月报
+    else:
          worksheet.merge_range('B1:F1', f'产品周报总汇' if '周报' in sheet_name else '产品月报总汇', header_format)
 
     worksheet.merge_range('B3:G3', f'{sheet_name.split("-")[0]}总汇表', header_format)
@@ -169,246 +203,167 @@ def calculate_metrics(df):
             else: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         df['注册成本'] = df['总消耗(U)'] / df['新增用户数']; df['首充成本'] = df['总消耗(U)'] / df['首存人数']
         df['盈余率(%)'] = df['充减提(U)'] / df['充值金额(U)']; df['老用户盈余率(%)'] = df['老用户充减提(U)'] / df['老用户充值金额(U)']
-
-        # !! 关键逻辑说明 !!
-        # 根据您的反馈，您希望直接使用源数据中的“老用户付费率”。
-        # 这里的重新计算是为了确保在生成周报、月报等聚合报表时，比率的准确性。
-        # 例如，周付费率 = (周总付费人数 / 周总日活人数)，而不是每日费率的简单平均。
-        # 因此，此处的计算对于保证最终报表的准确性至关重要，它确保了日报、周报、月报的统计口径一致。
+        
         df['老用户付费率(%)'] = df['老用户充值人数'] / df['老玩家日活']
-
         df['首存付费率(%)'] = df['首存人数'] / df['新增用户数']
         df['新增付费率(%)'] = df['新增付费人数'] / df['新增用户数']; df['首存ARPPU'] = df['首存充值金额(U)'] / df['首存人数']
         df['老用户ARPPU'] = df['老用户充值金额(U)'] / df['老用户充值人数']; df['ARPPU'] = df['充值金额(U)'] / df['充值人数']
-        df['首存盈余率(%)'] = 0 # 根据要求新增，但源数据无此字段，暂做占位
+        df['首存盈余率(%)'] = 0 
     df.replace([np.inf, -np.inf], np.nan, inplace=True); df.fillna(0, inplace=True)
     return df
 
 # ==================== 新增/重构的报表生成函数 ====================
 
 def calculate_period_repurchase_rates(df_recharge_source, period_start_date, period_end_date):
-    """
-    计算给定时间段内的加权平均复充率。
-    这对于周报和月报至关重要，因为不能简单地对每日费率进行平均。
-    """
-    if df_recharge_source is None or df_recharge_source.empty:
-        return {}
-
+    if df_recharge_source is None or df_recharge_source.empty: return {}
     df_recharge = df_recharge_source.copy()
-    if '首充人数' in df_recharge.columns:
-        df_recharge.rename(columns={'首充人数': '首存人数'}, inplace=True)
-
-    if '日期' not in df_recharge.columns or '首存人数' not in df_recharge.columns:
-        print("  [警告] 复充率源文件缺少'日期'或'首存人数'列。")
-        return {}
-
-    df_recharge['日期'] = pd.to_datetime(df_recharge['日期'], errors='coerce').dt.date
+    if '首充人数' in df_recharge.columns: df_recharge.rename(columns={'首充人数': '首存人数'}, inplace=True)
+    if '日期' not in df_recharge.columns or '首存人数' not in df_recharge.columns: return {}
 
     rate_map = {'次日复充率(%)': 1, '3日复充率(%)': 3, '7日复充率(%)': 7, '15日复充率(%)': 15, '30日复充率(%)': 30}
     calculated_rates = {}
 
     for rate_col, _ in rate_map.items():
-        if rate_col not in df_recharge.columns:
-            continue
-
-        # 筛选出在周期内的首存(cohort)数据
+        if rate_col not in df_recharge.columns: continue
         period_cohort_data = df_recharge[
-            (df_recharge['日期'] >= period_start_date) &
-            (df_recharge['日期'] <= period_end_date)
+            (df_recharge['日期'] >= period_start_date) & (df_recharge['日期'] <= period_end_date)
         ].copy()
-
         if period_cohort_data.empty:
-            calculated_rates[rate_col] = 0
-            continue
-
+            calculated_rates[rate_col] = 0; continue
         period_cohort_data['首存人数'] = pd.to_numeric(period_cohort_data['首存人数'], errors='coerce').fillna(0)
         period_cohort_data[rate_col] = pd.to_numeric(period_cohort_data[rate_col], errors='coerce').fillna(0)
-
-        # 计算加权值 (每日费率 * 当日首存人数)
         period_cohort_data['weighted_rate'] = period_cohort_data[rate_col] * period_cohort_data['首存人数']
-
         total_weighted_rate = period_cohort_data['weighted_rate'].sum()
         total_weight = period_cohort_data['首存人数'].sum()
-
-        calculated_rates[rate_col] = total_weighted_rate / total_weight if total_weight > 0 else 0
-
+        avg_rate = total_weighted_rate / total_weight if total_weight > 0 else 0
+        calculated_rates[rate_col] = avg_rate / 100.0
     return calculated_rates
 
 def aggregate_and_calculate_period(df_period, all_historical_data, start_date, end_date, df_recharge_source):
-    """ 对给定时间段的数据进行汇总和指标计算 """
-    if df_period.empty:
-        return pd.DataFrame()
-
+    if df_period.empty: return pd.DataFrame()
     df_summary = pd.DataFrame(df_period.sum(numeric_only=True)).T
     df_summary = calculate_metrics(df_summary)
-
-    # 计算LTV
+    
     for days in [7, 15, 30]:
-        # LTV的窗口应该从周期的开始日期算起
-        window_start_date = start_date
-        window_end_date = start_date + timedelta(days=days-1)
-
-        # 确保我们只包含在当前周期内的数据
+        window_start_date = start_date; window_end_date = start_date + timedelta(days=days-1)
         window_df = all_historical_data[
-            (all_historical_data['日期'] >= window_start_date) &
-            (all_historical_data['日期'] <= window_end_date) &
-            (all_historical_data['日期'] <= end_date) # 确保不超过报表日期
+            (all_historical_data['日期'] >= window_start_date) & (all_historical_data['日期'] <= window_end_date) &
+            (all_historical_data['日期'] <= end_date)
         ]
-
         total_recharge = window_df['充值金额(U)'].sum()
-
-        # LTV的分母应该是周期内的新增用户
         total_new_users = df_period['新增用户数'].sum()
         df_summary[f'LTV-{days}天'] = total_recharge / total_new_users if total_new_users else 0
 
-    # 计算历史累计值
     history_to_end = all_historical_data[all_historical_data['日期'] <= end_date]
     df_summary['历史消耗'] = history_to_end['总消耗(U)'].sum()
     df_summary['历史充提差'] = history_to_end['充减提(U)'].sum()
 
-    # 新增：计算并合并周期内的复充率
     period_rates = calculate_period_repurchase_rates(df_recharge_source, start_date, end_date)
     if period_rates:
         for col, value in period_rates.items():
             df_summary[col] = value
-
     return df_summary
 
 def generate_product_weekly_report(all_historical_data, report_date, writer, df_recharge_source):
     print("--- 正在生成【产品-周报总汇】 ---")
-
-    # 定义本周和上周的时间范围 (周一为一周的开始)
     this_week_start = report_date - timedelta(days=report_date.weekday())
     this_week_end = this_week_start + timedelta(days=6)
     last_week_start = this_week_start - timedelta(days=7)
     last_week_end = this_week_start - timedelta(days=1)
-
-    # 筛选数据
+    
     df_this_week = all_historical_data[(all_historical_data['日期'] >= this_week_start) & (all_historical_data['日期'] <= this_week_end)]
     df_last_week = all_historical_data[(all_historical_data['日期'] >= last_week_start) & (all_historical_data['日期'] <= last_week_end)]
 
-    # 汇总和计算
     row_this_week = aggregate_and_calculate_period(df_this_week, all_historical_data, this_week_start, this_week_end, df_recharge_source)
     row_last_week = aggregate_and_calculate_period(df_last_week, all_historical_data, last_week_start, last_week_end, df_recharge_source)
 
-    # 如果周数据为空，则创建一个空行以避免错误
-    if row_this_week.empty: row_this_week = pd.DataFrame(columns=row_last_week.columns, index=[0]).fillna(0)
+    if row_this_week.empty: row_this_week = pd.DataFrame(columns=row_last_week.columns if not row_last_week.empty else PRODUCT_REPORT_COLS, index=[0]).fillna(0)
     if row_last_week.empty: row_last_week = pd.DataFrame(columns=row_this_week.columns, index=[0]).fillna(0)
 
-    # 计算数差和环比
     row_diff = row_this_week.iloc[0] - row_last_week.iloc[0]
     with np.errstate(divide='ignore', invalid='ignore'):
         row_wow = (row_this_week.iloc[0] - row_last_week.iloc[0]) / row_last_week.iloc[0].replace(0, np.nan)
 
-    # 格式化输出
     df_final = pd.DataFrame(columns=PRODUCT_REPORT_COLS)
-
-    data_map = {
-        '上周': row_last_week.iloc[0],
-        '本周': row_this_week.iloc[0],
-        '数差': row_diff,
-        '环比': row_wow
-    }
+    data_map = {'上周': row_last_week.iloc[0], '本周': row_this_week.iloc[0], '数差': row_diff, '环比': row_wow}
     date_ranges = {
         '上周': f"{last_week_start.strftime('%m/%d')}-{last_week_end.strftime('%m/%d')}",
         '本周': f"{this_week_start.strftime('%m/%d')}-{this_week_end.strftime('%m/%d')}",
-        '数差': '', '环比': ''
+        '数差': '本周-上周', '环比': '本周/上周-1'
     }
-
     for period, data_row in data_map.items():
         new_row = {'周期': period, '始日-末期': date_ranges[period]}
         for col in PRODUCT_REPORT_COLS:
-            if col in data_row:
-                new_row[col] = data_row[col]
+            if col in data_row.index: new_row[col] = data_row[col]
         df_final = pd.concat([df_final, pd.DataFrame([new_row])], ignore_index=True)
 
-    # 格式化百分比列
     for col in df_final.columns:
         if '(%)' in col or '率' in col or col == '环比':
             df_final[col] = pd.to_numeric(df_final[col], errors='coerce').apply(lambda x: f"{x:.2%}" if pd.notna(x) else 'N/A')
-
     write_sheet_with_metadata(df_final[PRODUCT_REPORT_COLS], '产品-周报总汇', writer, '周报', EXCHANGE_RATE)
 
 
 def generate_product_monthly_report(all_historical_data, report_date, writer, df_recharge_source):
     print("--- 正在生成【产品-月报总汇】 ---")
-
     report_list = []
-
-    # 1. 添加最近4个月的月度数据
+    
     for i in range(4):
         target_month_date = report_date - relativedelta(months=i)
         start_of_month = target_month_date.replace(day=1)
         end_of_month = target_month_date.replace(day=calendar.monthrange(target_month_date.year, target_month_date.month)[1])
-
         df_month = all_historical_data[(all_historical_data['日期'] >= start_of_month) & (all_historical_data['日期'] <= end_of_month)]
         if df_month.empty: continue
-
         row_month = aggregate_and_calculate_period(df_month, all_historical_data, start_of_month, end_of_month, df_recharge_source)
-        row_month['开始'] = start_of_month.strftime('%Y/%m/%d')
-        row_month['结束'] = end_of_month.strftime('%Y/%m/%d')
-        row_month['周期'] = f"{start_of_month.month}月"
-        row_month['始日-末期'] = f"{start_of_month.month}月"
+        row_month['开始'] = start_of_month.strftime('%Y/%m/%d'); row_month['结束'] = end_of_month.strftime('%Y/%m/%d')
+        row_month['周期'] = f"{start_of_month.month}月"; row_month['始日-末期'] = f"{start_of_month.month}月"
         report_list.append(row_month)
-
-    # 2. 添加最近2个月的周数据
+        
     for i in range(2):
         target_month_date = report_date - relativedelta(months=i)
         start_of_month = target_month_date.replace(day=1)
         _, days_in_month = calendar.monthrange(target_month_date.year, target_month_date.month)
-
         for week_num in range(1, 6):
             start_of_week = start_of_month + timedelta(days=(week_num-1)*7)
             end_of_week = start_of_week + timedelta(days=6)
-
-            if start_of_week.month != target_month_date.month or start_of_week.day > days_in_month:
-                break
-
+            if start_of_week.month != target_month_date.month or start_of_week.day > days_in_month: break
             df_week = all_historical_data[(all_historical_data['日期'] >= start_of_week) & (all_historical_data['日期'] <= end_of_week)]
             if df_week.empty: continue
-
             row_week = aggregate_and_calculate_period(df_week, all_historical_data, start_of_week, end_of_week, df_recharge_source)
-            row_week['开始'] = start_of_week.strftime('%Y/%m/%d')
-            row_week['结束'] = end_of_week.strftime('%Y/%m/%d')
-            row_week['周期'] = f"第{week_num}周"
-            row_week['始日-末期'] = f"{start_of_week.strftime('%m/%d')}-{end_of_week.strftime('%m/%d')}"
+            row_week['开始'] = start_of_week.strftime('%Y/%m/%d'); row_week['结束'] = end_of_week.strftime('%Y/%m/%d')
+            row_week['周期'] = f"第{week_num}周"; row_week['始日-末期'] = f"{start_of_week.strftime('%m/%d')}-{end_of_week.strftime('%m/%d')}"
             report_list.append(row_week)
 
-    if not report_list:
-        print("  [警告] 没有足够的数据生成月报。")
-        return
-
+    if not report_list: print("  [警告] 没有足够的数据生成月报。"); return
     df_final = pd.concat(report_list, ignore_index=True)
-
-    # 添加环比和数差（本月 vs 上月）
+    
     this_month_data = df_final[df_final['周期'] == f"{report_date.month}月"].iloc[0:1]
     last_month_date = report_date - relativedelta(months=1)
     last_month_data = df_final[df_final['周期'] == f"{last_month_date.month}月"].iloc[0:1]
-
+    
     if not this_month_data.empty and not last_month_data.empty:
-        diff_row = this_month_data.select_dtypes(include=np.number).iloc[0] - last_month_data.select_dtypes(include=np.number).iloc[0]
-        wow_row = diff_row / last_month_data.select_dtypes(include=np.number).iloc[0].replace(0, np.nan)
+        diff_row_data = this_month_data.select_dtypes(include=np.number).iloc[0] - last_month_data.select_dtypes(include=np.number).iloc[0]
+        wow_row_data = diff_row_data / last_month_data.select_dtypes(include=np.number).iloc[0].replace(0, np.nan)
+        
+        diff_row = pd.DataFrame([{'周期': '数差', '始日-末期': '本月-上月'}])
+        wow_row = pd.DataFrame([{'周期': '环比', '始日-末期': '本月/上月-1'}])
 
-        df_final = pd.concat([df_final, pd.DataFrame([{'周期': '环比'}])], ignore_index=True)
-        df_final = pd.concat([df_final, pd.DataFrame([{'周期': '数差'}])], ignore_index=True)
+        for col in diff_row_data.index:
+             if col in PRODUCT_REPORT_COLS: diff_row[col] = diff_row_data[col]
+        for col in wow_row_data.index:
+             if col in PRODUCT_REPORT_COLS: wow_row[col] = wow_row_data[col]
+        
+        df_final = pd.concat([df_final, diff_row, wow_row], ignore_index=True)
 
-        df_final.iloc[-2, df_final.columns.get_loc('总消耗(U)')] = wow_row.get('总消耗(U)')
-        df_final.iloc[-1, df_final.columns.get_loc('总消耗(U)')] = diff_row.get('总消耗(U)')
-
-
-    # 填充缺失列并排序
     for col in PRODUCT_MONTHLY_REPORT_COLS:
-        if col not in df_final.columns:
-            df_final[col] = 0
-
+        if col not in df_final.columns: df_final[col] = ''
     df_final = df_final[PRODUCT_MONTHLY_REPORT_COLS].fillna('')
     write_sheet_with_metadata(df_final, '产品-月报总汇', writer, '月报', EXCHANGE_RATE)
 
 
-def generate_summary_sheet(df_source, group_key, final_cols, time_period_str, sheet_name, writer, all_historical_data=None, df_recharge=None):
+def generate_summary_sheet(df_source, group_key, final_cols, time_period_str, sheet_name, writer, all_historical_data=None, df_recharge_dept=None, df_recharge_total=None):
     if df_source.empty: return
     df_report = df_source.copy()
-
+    
     if time_period_str == '日报':
         if group_key: df_summary = df_report.groupby(group_key, as_index=False).sum(numeric_only=True)
         else: df_summary = pd.DataFrame(df_report.sum(numeric_only=True)).T; df_summary['产品'] = 'aa-巴基斯坦（EpiWin）'
@@ -427,18 +382,29 @@ def generate_summary_sheet(df_source, group_key, final_cols, time_period_str, sh
                     ltv_agg[f'LTV-{days}天'] = ltv_agg['充值金额(U)'] / ltv_agg['新增用户数'].replace(0, np.nan)
                     if not ltv_agg.empty: df_summary = pd.merge(df_summary, ltv_agg[group_cols + [f'LTV-{days}天']], on=group_cols, how='left')
             else: df_summary[f'LTV-{days}天'] = 0
-        if '部门' in group_key and df_recharge is not None and not df_recharge.empty: df_summary = pd.merge(df_summary, df_recharge, on='部门', how='left')
+        
+        # 将复充率合并到日报
+        if not group_key and df_recharge_total is not None and not df_recharge_total.empty:
+            for rate_col, value in df_recharge_total.items():
+                df_summary[rate_col] = value
+        elif '部门' in group_key and df_recharge_dept is not None and not df_recharge_dept.empty:
+             # [修正] 渠道报表也应该继承其所属部门的复充率
+            if '渠道来源' in group_key:
+                df_summary = pd.merge(df_summary, df_recharge_dept, on='部门', how='left')
+            else:
+                df_summary = pd.merge(df_summary, df_recharge_dept, on='部门', how='left')
+        
         df_summary['日期'] = report_date
-    else:
+    else: # 周报/月报总汇 (仅用于部门)
         grouping_keys = group_key + ['日期'] if group_key else ['日期']
         if '产品' in group_key: grouping_keys = ['日期']
         df_summary = df_report.groupby(grouping_keys, as_index=False).sum(numeric_only=True)
         if '产品' in group_key: df_summary['产品'] = 'aa-巴基斯坦（EpiWin）'
         df_summary = calculate_metrics(df_summary)
-
+    
     for col in final_cols:
         if col not in df_summary.columns: df_summary[col] = 0
-
+    
     if time_period_str != '日报':
         total_row = pd.DataFrame(df_summary.sum(numeric_only=True)).T; total_row = calculate_metrics(total_row)
         total_row['日期'] = "总计"
@@ -446,6 +412,11 @@ def generate_summary_sheet(df_source, group_key, final_cols, time_period_str, sh
         for col in df_summary.columns:
             if col not in total_row.columns: total_row[col] = ''
         df_summary = pd.concat([df_summary.fillna(''), total_row], ignore_index=True)
+    
+    # 最终格式化：所有比率列都应用百分比格式
+    for col in df_summary.columns:
+        if '(%)' in col or '率' in col:
+             df_summary[col] = pd.to_numeric(df_summary[col], errors='coerce').apply(lambda x: f"{x:.2%}" if pd.notna(x) else 'N/A')
 
     write_sheet_with_metadata(df_summary[final_cols], sheet_name, writer, time_period_str, EXCHANGE_RATE)
 
@@ -456,15 +427,15 @@ def main():
     df_spend = get_spend_data_from_google_sheet(SPEND_SHEET_URL)
     df_mapping = read_source_file('总代名称部门规律表.csv')
     df_recharge_source = read_source_file('download_首充用户分析_*.csv')
-
-    core_files = {'渠道报表': df_channel, '部门映射表': df_mapping, '复充率表': df_recharge_source}
+    
+    core_files = {'渠道报表': df_channel, '部门映射表': df_mapping}
     for name, df in core_files.items():
         if df is None: print(f"[致命错误] {name}缺失, 无法继续。"); return
-
+    
     for df in [df_channel, df_ops, df_spend, df_recharge_source]:
         if df is not None and '日期' in df.columns:
             df['日期'] = pd.to_datetime(df['日期'], errors='coerce').dt.date
-
+    
     print("\n--- 正在合并所有历史数据 ---")
     df_merged = df_channel.copy()
     if df_ops is not None and '老玩家日活' in df_ops.columns:
@@ -472,35 +443,37 @@ def main():
     if df_spend is not None:
         df_merged = pd.merge(df_merged, df_spend.drop_duplicates(subset=['日期']), on='日期', how='left')
     df_merged.fillna(0, inplace=True)
-
+    
     df_merged['产品'] = 'aa-巴基斯坦（EpiWin）'
-
+    
     cols_to_numerify = ['新增用户数', '充值人数', '充值金额', '提现金额', '首存人数', '首存充值金额', '新增付费人数', '新增充值金额', '老用户充值人数', '老用户充值金额', '老用户提现金额', '老玩家日活']
     for col in cols_to_numerify:
         if col in df_merged.columns: df_merged[col] = pd.to_numeric(df_merged[col], errors='coerce').fillna(0)
     df_merged['部门'] = df_merged['渠道来源'].apply(lambda x: next((dept for keyword, dept in zip(df_mapping.iloc[:, 1], df_mapping.iloc[:, 0]) if keyword in str(x)), 'unknown'))
     all_historical_data = calculate_metrics(df_merged)
-
-    all_historical_data['日期'] = pd.to_datetime(all_historical_data['日期'], errors='coerce').dt.date
+    
     all_historical_data.dropna(subset=['日期'], inplace=True)
+    all_historical_data['日期'] = pd.to_datetime(all_historical_data['日期'], errors='coerce').dt.date
 
     report_date = pd.to_datetime(OVERRIDE_DATE).date() if OVERRIDE_DATE and str(OVERRIDE_DATE).strip() != "" else all_historical_data['日期'].max()
     print(f"\n[核心] 将为日期: {report_date} 生成报表")
 
-    df_recharge_final = read_and_process_recharge_data(df_recharge_source, df_mapping, report_date)
+    df_recharge_dept, df_recharge_total = pd.DataFrame(), pd.Series(dtype=float)
+    if df_recharge_source is not None:
+         df_recharge_dept, df_recharge_total = read_and_process_recharge_data(df_recharge_source, df_mapping, report_date)
 
     df_daily = all_historical_data[all_historical_data['日期'] == report_date].copy()
     start_of_week = report_date - timedelta(days=report_date.weekday())
     df_weekly = all_historical_data[(all_historical_data['日期'] >= start_of_week) & (all_historical_data['日期'] <= report_date)].copy()
     start_of_month = report_date.replace(day=1)
     df_monthly = all_historical_data[(all_historical_data['日期'] >= start_of_month) & (all_historical_data['日期'] <= report_date)].copy()
-
+    
     with pd.ExcelWriter(OUTPUT_FILENAME, engine='xlsxwriter') as writer:
         # --- 日报 ---
-        generate_summary_sheet(df_daily, [], PRODUCT_COLS, '日报', '产品-日报', writer, all_historical_data=all_historical_data, df_recharge=df_recharge_final)
-        generate_summary_sheet(df_daily, ['部门'], DEPT_COLS, '日报', '部门-日报', writer, all_historical_data=all_historical_data, df_recharge=df_recharge_final)
-        generate_summary_sheet(df_daily, ['部门', '渠道来源'], CHANNEL_COLS, '日报', '渠道-日报', writer, all_historical_data=all_historical_data, df_recharge=df_recharge_final)
-
+        generate_summary_sheet(df_daily, [], PRODUCT_COLS, '日报', '产品-日报', writer, all_historical_data=all_historical_data, df_recharge_total=df_recharge_total)
+        generate_summary_sheet(df_daily, ['部门'], DEPT_COLS, '日报', '部门-日报', writer, all_historical_data=all_historical_data, df_recharge_dept=df_recharge_dept)
+        generate_summary_sheet(df_daily, ['部门', '渠道来源'], CHANNEL_COLS, '日报', '渠道-日报', writer, all_historical_data=all_historical_data, df_recharge_dept=df_recharge_dept)
+        
         # --- 部门周报/月报总汇 ---
         generate_summary_sheet(df_weekly, ['部门'], DEPT_COLS, '周报总汇', '部门-周报总汇', writer)
         generate_summary_sheet(df_monthly, ['部门'], DEPT_COLS, '月报总汇', '部门-月报总汇', writer)
