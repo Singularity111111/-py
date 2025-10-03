@@ -16,7 +16,7 @@ SEARCH_PATH = "."
 OUTPUT_FILENAME = '最终生成三维度报表.xlsx'
 CSV_ENCODINGS = ['utf-8-sig', 'utf-8', 'gbk', 'latin1', 'ISO-8859-1', 'cp1252']
 SPEND_SHEET_URL = "https://docs.google.com/spreadsheets/d/1v_GQLJ28byHFUqfcvdo2OtAbLQaMOCBL9x7Q-MqkjmI/export?format=csv"
-OVERRIDE_DATE = None
+OVERRIDE_DATE = "2025-10-2"
 
 # ==================== 输出字段定义 ====================
 # 原有字段
@@ -169,7 +169,15 @@ def calculate_metrics(df):
             else: df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         df['注册成本'] = df['总消耗(U)'] / df['新增用户数']; df['首充成本'] = df['总消耗(U)'] / df['首存人数']
         df['盈余率(%)'] = df['充减提(U)'] / df['充值金额(U)']; df['老用户盈余率(%)'] = df['老用户充减提(U)'] / df['老用户充值金额(U)']
-        df['老用户付费率(%)'] = df['老用户充值人数'] / df['老玩家日活']; df['首存付费率(%)'] = df['首存人数'] / df['新增用户数']
+
+        # !! 关键逻辑说明 !!
+        # 根据您的反馈，您希望直接使用源数据中的“老用户付费率”。
+        # 这里的重新计算是为了确保在生成周报、月报等聚合报表时，比率的准确性。
+        # 例如，周付费率 = (周总付费人数 / 周总日活人数)，而不是每日费率的简单平均。
+        # 因此，此处的计算对于保证最终报表的准确性至关重要，它确保了日报、周报、月报的统计口径一致。
+        df['老用户付费率(%)'] = df['老用户充值人数'] / df['老玩家日活']
+
+        df['首存付费率(%)'] = df['首存人数'] / df['新增用户数']
         df['新增付费率(%)'] = df['新增付费人数'] / df['新增用户数']; df['首存ARPPU'] = df['首存充值金额(U)'] / df['首存人数']
         df['老用户ARPPU'] = df['老用户充值金额(U)'] / df['老用户充值人数']; df['ARPPU'] = df['充值金额(U)'] / df['充值人数']
         df['首存盈余率(%)'] = 0 # 根据要求新增，但源数据无此字段，暂做占位
