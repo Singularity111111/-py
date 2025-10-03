@@ -178,7 +178,55 @@ def calculate_metrics(df):
 
 # ==================== 新增/重构的报表生成函数 ====================
 
-def aggregate_and_calculate_period(df_period, all_historical_data, end_date):
+def calculate_period_repurchase_rates(df_recharge_source, period_start_date, period_end_date):
+    """
+    计算给定时间段内的加权平均复充率。
+    这对于周报和月报至关重要，因为不能简单地对每日费率进行平均。
+    """
+    if df_recharge_source is None or df_recharge_source.empty:
+        return {}
+
+    df_recharge = df_recharge_source.copy()
+    if '首充人数' in df_recharge.columns:
+        df_recharge.rename(columns={'首充人数': '首存人数'}, inplace=True)
+
+    if '日期' not in df_recharge.columns or '首存人数' not in df_recharge.columns:
+        print("  [警告] 复充率源文件缺少'日期'或'首存人数'列。")
+        return {}
+
+    df_recharge['日期'] = pd.to_datetime(df_recharge['日期'], errors='coerce').dt.date
+
+    rate_map = {'次日复充率(%)': 1, '3日复充率(%)': 3, '7日复充率(%)': 7, '15日复充率(%)': 15, '30日复充率(%)': 30}
+    calculated_rates = {}
+
+    for rate_col, _ in rate_map.items():
+        if rate_col not in df_recharge.columns:
+            continue
+
+        # 筛选出在周期内的首存(cohort)数据
+        period_cohort_data = df_recharge[
+            (df_recharge['日期'] >= period_start_date) &
+            (df_recharge['日期'] <= period_end_date)
+        ].copy()
+
+        if period_cohort_data.empty:
+            calculated_rates[rate_col] = 0
+            continue
+
+        period_cohort_data['首存人数'] = pd.to_numeric(period_cohort_data['首存人数'], errors='coerce').fillna(0)
+        period_cohort_data[rate_col] = pd.to_numeric(period_cohort_data[rate_col], errors='coerce').fillna(0)
+
+        # 计算加权值 (每日费率 * 当日首存人数)
+        period_cohort_data['weighted_rate'] = period_cohort_data[rate_col] * period_cohort_data['首存人数']
+
+        total_weighted_rate = period_cohort_data['weighted_rate'].sum()
+        total_weight = period_cohort_data['首存人数'].sum()
+
+        calculated_rates[rate_col] = total_weighted_rate / total_weight if total_weight > 0 else 0
+
+    return calculated_rates
+
+def aggregate_and_calculate_period(df_period, all_historical_data, start_date, end_date, df_recharge_source):
     """ 对给定时间段的数据进行汇总和指标计算 """
     if df_period.empty:
         return pd.DataFrame()
@@ -188,10 +236,21 @@ def aggregate_and_calculate_period(df_period, all_historical_data, end_date):
 
     # 计算LTV
     for days in [7, 15, 30]:
-        start_date = end_date - timedelta(days=days-1)
-        window_df = df_period[(df_period['日期'] >= start_date) & (df_period['日期'] <= end_date)]
+        # LTV的窗口应该从周期的开始日期算起
+        window_start_date = start_date
+        window_end_date = start_date + timedelta(days=days-1)
+
+        # 确保我们只包含在当前周期内的数据
+        window_df = all_historical_data[
+            (all_historical_data['日期'] >= window_start_date) &
+            (all_historical_data['日期'] <= window_end_date) &
+            (all_historical_data['日期'] <= end_date) # 确保不超过报表日期
+        ]
+
         total_recharge = window_df['充值金额(U)'].sum()
-        total_new_users = window_df['新增用户数'].sum()
+
+        # LTV的分母应该是周期内的新增用户
+        total_new_users = df_period['新增用户数'].sum()
         df_summary[f'LTV-{days}天'] = total_recharge / total_new_users if total_new_users else 0
 
     # 计算历史累计值
@@ -199,9 +258,15 @@ def aggregate_and_calculate_period(df_period, all_historical_data, end_date):
     df_summary['历史消耗'] = history_to_end['总消耗(U)'].sum()
     df_summary['历史充提差'] = history_to_end['充减提(U)'].sum()
 
+    # 新增：计算并合并周期内的复充率
+    period_rates = calculate_period_repurchase_rates(df_recharge_source, start_date, end_date)
+    if period_rates:
+        for col, value in period_rates.items():
+            df_summary[col] = value
+
     return df_summary
 
-def generate_product_weekly_report(all_historical_data, report_date, writer):
+def generate_product_weekly_report(all_historical_data, report_date, writer, df_recharge_source):
     print("--- 正在生成【产品-周报总汇】 ---")
 
     # 定义本周和上周的时间范围 (周一为一周的开始)
@@ -215,8 +280,8 @@ def generate_product_weekly_report(all_historical_data, report_date, writer):
     df_last_week = all_historical_data[(all_historical_data['日期'] >= last_week_start) & (all_historical_data['日期'] <= last_week_end)]
 
     # 汇总和计算
-    row_this_week = aggregate_and_calculate_period(df_this_week, all_historical_data, this_week_end)
-    row_last_week = aggregate_and_calculate_period(df_last_week, all_historical_data, last_week_end)
+    row_this_week = aggregate_and_calculate_period(df_this_week, all_historical_data, this_week_start, this_week_end, df_recharge_source)
+    row_last_week = aggregate_and_calculate_period(df_last_week, all_historical_data, last_week_start, last_week_end, df_recharge_source)
 
     # 如果周数据为空，则创建一个空行以避免错误
     if row_this_week.empty: row_this_week = pd.DataFrame(columns=row_last_week.columns, index=[0]).fillna(0)
@@ -257,7 +322,7 @@ def generate_product_weekly_report(all_historical_data, report_date, writer):
     write_sheet_with_metadata(df_final[PRODUCT_REPORT_COLS], '产品-周报总汇', writer, '周报', EXCHANGE_RATE)
 
 
-def generate_product_monthly_report(all_historical_data, report_date, writer):
+def generate_product_monthly_report(all_historical_data, report_date, writer, df_recharge_source):
     print("--- 正在生成【产品-月报总汇】 ---")
 
     report_list = []
@@ -271,7 +336,7 @@ def generate_product_monthly_report(all_historical_data, report_date, writer):
         df_month = all_historical_data[(all_historical_data['日期'] >= start_of_month) & (all_historical_data['日期'] <= end_of_month)]
         if df_month.empty: continue
 
-        row_month = aggregate_and_calculate_period(df_month, all_historical_data, end_of_month)
+        row_month = aggregate_and_calculate_period(df_month, all_historical_data, start_of_month, end_of_month, df_recharge_source)
         row_month['开始'] = start_of_month.strftime('%Y/%m/%d')
         row_month['结束'] = end_of_month.strftime('%Y/%m/%d')
         row_month['周期'] = f"{start_of_month.month}月"
@@ -294,7 +359,7 @@ def generate_product_monthly_report(all_historical_data, report_date, writer):
             df_week = all_historical_data[(all_historical_data['日期'] >= start_of_week) & (all_historical_data['日期'] <= end_of_week)]
             if df_week.empty: continue
 
-            row_week = aggregate_and_calculate_period(df_week, all_historical_data, end_of_week)
+            row_week = aggregate_and_calculate_period(df_week, all_historical_data, start_of_week, end_of_week, df_recharge_source)
             row_week['开始'] = start_of_week.strftime('%Y/%m/%d')
             row_week['结束'] = end_of_week.strftime('%Y/%m/%d')
             row_week['周期'] = f"第{week_num}周"
@@ -433,10 +498,11 @@ def main():
         generate_summary_sheet(df_monthly, ['部门'], DEPT_COLS, '月报总汇', '部门-月报总汇', writer)
 
         # --- 新的产品周报/月报 ---
-        generate_product_weekly_report(all_historical_data, report_date, writer)
-        generate_product_monthly_report(all_historical_data, report_date, writer)
+        generate_product_weekly_report(all_historical_data, report_date, writer, df_recharge_source)
+        generate_product_monthly_report(all_historical_data, report_date, writer, df_recharge_source)
 
     print("\n" + "="*50); print(f"🎉 报表生成成功！请查看: {OUTPUT_FILENAME}"); print("="*50)
 
 if __name__ == '__main__':
     main()
+
