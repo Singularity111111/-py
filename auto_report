@@ -1,7 +1,7 @@
 import time
 import os
 import glob
-from datetime import date, timedelta
+from datetime import date
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
@@ -14,153 +14,126 @@ CHROMEDRIVER_PATH = r"C:\Users\User\Downloads\chromedriver-win64\chromedriver-wi
 LOGIN_URL = "https://admindmgkgir666.epiwin24admgf4f73402ghudsd9k1vie9g82h9.com/#/login"
 USERNAME = "Touhou002"
 PASSWORD = "123456"
-
-
 # ================================================
 
 def find_and_rename_newest_file(download_path, report_name, existing_files):
-    """
-    [优化] 在指定超时时间内，循环查找最新下载的文件并根据报表名称重命名。
-    这比固定的`time.sleep()`更可靠。
-    """
+    """查找最新下载的文件并根据报表名称重命名"""
     print(f"  等待 '{report_name}' 文件下载完成...")
-    timeout = 45  # 等待下载的超时时间（秒）
-    start_time = time.time()
-    newest_file = None
-
-    while time.time() - start_time < timeout:
-        current_files = set(
-            glob.glob(os.path.join(download_path, '*.xlsx')) + glob.glob(os.path.join(download_path, '*.csv')))
-        new_files = current_files - existing_files
-
-        if new_files:
-            # 找到最新修改的文件
-            newest_file = max(new_files, key=os.path.getctime)
-            # 检查文件是否仍在下载（.crdownload扩展名）
-            if ".crdownload" in newest_file or newest_file.endswith(".tmp"):
-                newest_file = None  # 如果还在下载，则继续等待
-                time.sleep(1)
-                continue
-            print(f"  检测到新文件: {os.path.basename(newest_file)}")
-            break
-        time.sleep(1)
-
-    if not newest_file:
-        print(f"  [错误] 在 {timeout} 秒内未找到为 '{report_name}' 下载的新文件！脚本将终止。")
-        return False
-
+    time.sleep(20) # 为下载大文件预留足够时间
+    
+    current_files = set(glob.glob(os.path.join(download_path, '*.xlsx')) + glob.glob(os.path.join(download_path, '*.csv')))
+    new_files = current_files - existing_files
+    
+    if not new_files:
+        print(f"  [警告] 未找到为 '{report_name}' 下载的新文件！")
+        return
+    
+    newest_file = new_files.pop()
     today_str = date.today().strftime('%Y-%m-%d')
     new_filename = f"download_{report_name}_{today_str}.csv"
     new_filepath = os.path.join(download_path, new_filename)
-
+    
     if os.path.exists(new_filepath):
         os.remove(new_filepath)
-        print(f"  发现旧的同名文件，已删除: {new_filename}")
-
     os.rename(newest_file, new_filepath)
     print(f"  [成功] 文件已重命名为: {new_filename}")
-    return True
 
+def download_report(driver, wait, report_config):
+    """一个通用的函数，用于点击菜单、设置日期并导出报表"""
+    print(f"\n--- 正在处理: {report_config['name']} ---")
+    
+    # 1. 点击子菜单
+    print(f"  点击子菜单: {report_config['name']}...")
+    menu_item = wait.until(EC.element_to_be_clickable((By.XPATH, report_config['menu_xpath'])))
+    driver.execute_script("arguments[0].click();", menu_item)
+    time.sleep(3)
+
+    # 2. 点击【近90天】
+    print("  点击【近90天】时间范围...")
+    days_tab_xpath = "//span[text()='近90天']"
+    ninety_days_button = wait.until(EC.element_to_be_clickable((By.XPATH, days_tab_xpath)))
+    driver.execute_script("arguments[0].click();", ninety_days_button)
+    
+    # 3. 等待数据加载
+    print("  等待数据刷新（15秒）...")
+    time.sleep(15)
+
+    # 4. 导出
+    downloads_path = os.path.join(os.path.expanduser('~'), 'Downloads')
+    existing_files = set(glob.glob(os.path.join(downloads_path, '*.xlsx')) + glob.glob(os.path.join(downloads_path, '*.csv')))
+    
+    print("  点击'导出'按钮...")
+    export_button_xpath = "//button[contains(., '导出')]"
+    export_button = wait.until(EC.element_to_be_clickable((By.XPATH, export_button_xpath)))
+    driver.execute_script("arguments[0].click();", export_button)
+    
+    # 5. 重命名
+    find_and_rename_newest_file(downloads_path, report_config['name'], existing_files)
 
 # --- 主程序 ---
-print("--- 全能数据下载器开始运行 ---")
+print("--- 全能数据下载器开始运行 (v6.1 - 最终修正版) ---")
 s = Service(CHROMEDRIVER_PATH)
 chrome_options = Options()
-# (伪装选项)
 chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
 chrome_options.add_experimental_option('useAutomationExtension', False)
-chrome_options.add_argument(
-    'user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36')
+chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36')
 chrome_options.add_argument('--disable-blink-features=AutomationControlled')
 
 try:
     driver = webdriver.Chrome(service=s, options=chrome_options)
-    wait = WebDriverWait(driver, 20)
+    wait = WebDriverWait(driver, 30)
     driver.get(LOGIN_URL)
-
-    # (登录)
+    
     print("页面加载中，等待登录框...")
     wait.until(EC.presence_of_element_located((By.XPATH, "//input[@placeholder='账户']"))).send_keys(USERNAME)
     driver.find_element(By.XPATH, "//input[@placeholder='密码']").send_keys(PASSWORD)
     driver.find_element(By.XPATH, "//button[contains(., '登录')]").click()
-
-    # (手动验证)
-    print("\n" + "=" * 50 + "\n脚本已暂停！请手动输入谷歌验证码并完成登录。")
+    
+    print("\n" + "="*50 + "\n脚本已暂停！请手动输入谷歌验证码并完成登录。")
     input("登录成功后，请回到此窗口，按 Enter (回车) 键继续...")
-    print("\n" + "=" * 50 + "\n脚本已恢复，开始批量下载所有数据源...")
+    print("\n" + "="*50 + "\n脚本已恢复，开始分步下载数据源...")
 
-    # 报表列表保持不变
-    reports_to_download = [
-        {"name": "渠道报表",
-         "url": "https://admindmgkgir666.epiwin24admgf4f73402ghudsd9k1vie9g82h9.com/#/stat/dailySummaryChannel"},
-        {"name": "运营报表",
-         "url": "https://admindmgkgir666.epiwin24admgf4f73402ghudsd9k1vie9g82h9.com/#/stat/operateDaily"},
-        {"name": "首充用户分析",
-         "url": "https://admindmgkgir666.epiwin24admgf4f73402ghudsd9k1vie9g82h9.com/#/stat/userAnalysis"},
-        {"name": "用户留存",
-         "url": "https://admindmgkgir666.epiwin24admgf4f73402ghudsd9k1vie9g82h9.com/#/stat/userRetentionLog"},
-        {"name": "新增用户LTV",
-         "url": "https://admindmgkgir666.epiwin24admgf4f73402ghudsd9k1vie9g82h9.com/#/stat/userLtvLog"}
+    path1_reports = [
+        {"name": "渠道报表", "menu_xpath": "//span[contains(., '日数据概览_渠道报表')]"},
+        {"name": "运营报表", "menu_xpath": "//span[contains(., '日数据概览')]"},
     ]
-
-    downloads_path = os.path.join(os.path.expanduser('~'), 'Downloads')
-
-    for report in reports_to_download:
-        print(f"\n--- 正在处理: {report['name']} ---")
-
-        # 1. 直接跳转到报表页面
-        print(f"  直接跳转到页面...")
-        driver.get(report['url'])
-
-        # [逻辑修正] 2. 直接点击【近90天】快捷按钮
-        print("  点击【近90天】快捷按钮...")
+    path2_reports = [
+        {"name": "首充用户分析", "menu_xpath": "//span[contains(., '首充用户分析')]"},
+        {"name": "首充用户LTV", "menu_xpath": "//span[contains(., '首充用户LTV')]"} 
+    ]
+    
+    print("\n=== 开始执行路径1：下载直接可见的报表 ===")
+    for report_config in path1_reports:
         try:
-            # 使用更精确的XPATH来定位按钮
-            ninety_days_button = wait.until(EC.element_to_be_clickable((By.XPATH,
-                                                                        "//span[contains(@class, 'arco-tabs-tab-title') and text()='近90天'] | //span[text()='近90天']")))
-            driver.execute_script("arguments[0].click();", ninety_days_button)
-            print("  已点击【近90天】，等待页面响应...")
-            time.sleep(3)  # 等待3秒让页面上的日期和数据请求发出
+            download_report(driver, wait, report_config)
         except Exception as e:
-            print(f"  [错误] 未能点击【近90天】按钮: {e}。请检查页面元素是否存在。")
-            continue
-
-        # 3. 点击“查询”并等待
-        print("  正在点击'查询'按钮...")
-        try:
-            query_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., '查询')]")))
-            driver.execute_script("arguments[0].click();", query_button)
-            print("  等待新数据加载（15秒）...")
-            time.sleep(15)
-        except Exception:
-            print("  [警告] 未找到'查询'按钮，直接继续...")
+            print(f"  [严重错误] 下载 '{report_config['name']}' 失败: {e}")
+            driver.refresh()
             time.sleep(5)
 
-        # 4. 记录下载前的文件状态并导出
-        existing_files = set(
-            glob.glob(os.path.join(downloads_path, '*.xlsx')) + glob.glob(os.path.join(downloads_path, '*.csv')))
+    print("\n=== 开始执行路径2：下载需点击父菜单的报表 ===")
+    try:
+        player_analysis_xpath = "//span[contains(., '玩家分析')]"
+        print(f"  点击一次父菜单: 【玩家分析】...")
+        parent_menu = wait.until(EC.element_to_be_clickable((By.XPATH, player_analysis_xpath)))
+        driver.execute_script("arguments[0].click();", parent_menu)
+        time.sleep(2)
 
-        print("  正在点击'导出'按钮...")
-        try:
-            export_button = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(., '导出')]")))
-            driver.execute_script("arguments[0].click();", export_button)
-        except Exception as e:
-            print(f"  [错误] 点击'导出'按钮失败: {e}")
-            continue
+        for report_config in path2_reports:
+            try:
+                download_report(driver, wait, report_config)
+            except Exception as e:
+                print(f"  [严重错误] 下载 '{report_config['name']}' 失败: {e}")
+    except Exception as e:
+        print(f"  [严重错误] 点击父菜单【玩家分析】失败: {e}")
 
-        # 5. 查找并重命名文件
-        if not find_and_rename_newest_file(downloads_path, report['name'], existing_files):
-            break  # 如果某个文件下载失败，则停止后续操作
-
-    print("\n" + "=" * 50)
+    print("\n" + "="*50)
     print("🎉 全部数据源下载完成！")
-    print("=" * 50)
+    print("="*50)
 
 except Exception as e:
     print(f"\n脚本运行中发生严重错误: {e}")
-
 finally:
     if 'driver' in locals() and driver:
         driver.quit()
     print("--- 脚本运行结束 ---")
-
